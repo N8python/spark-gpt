@@ -1,0 +1,10 @@
+# Core. Install torch FIRST (see README: it must match your CUDA), then
+# flash-attn (needs torch present at build time: pip install flash-attn
+# --no-build-isolation), then the rest.
+numpy>=1.26
+safetensors>=0.4
+
+# Optional
+wandb>=0.17          # --wandb logging
+transformers>=4.51   # loading the exported HF checkpoints
+datasets>=2.19       # the FineWeb data-prep snippet in the README

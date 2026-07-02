@@ -26,11 +26,29 @@ training, and checkpoint export. No framework, no config system, no second file.
   (the byte tokenizer is a plain `tokenizer.json`: byte-level BPE with an empty
   merge table). Also loads in `mlx_lm` as `model_type: qwen3`.
 
-## Requirements
+## Installation
 
-Python ≥ 3.10, PyTorch ≥ 2.4 (CUDA), [flash-attn](https://github.com/Dao-AILab/flash-attention) ≥ 2.6,
-`numpy`, `safetensors`. Optional: `wandb` for logging, `transformers` to load
-the exported checkpoints.
+Python ≥ 3.10 and a CUDA GPU. Order matters — flash-attn compiles against
+torch, so torch must be installed first:
+
+```bash
+# 1. PyTorch with CUDA — pick the index for your CUDA version, see pytorch.org
+pip install torch --index-url https://download.pytorch.org/whl/cu130
+
+# 2. flash-attn (pip builds it against the torch you just installed; on an
+#    unusual arch like GB10/sm_121 this compiles from source — takes a while)
+pip install flash-attn --no-build-isolation
+
+# 3. everything else (wandb/transformers/datasets are optional; see the file)
+pip install -r requirements.txt
+```
+
+Tested with Python 3.12, torch 2.12.0+cu130, flash-attn 2.8.3, numpy 2.4,
+safetensors 0.8, transformers 5.11 on NVIDIA GB10 (DGX Spark). Sanity check:
+
+```bash
+python -c "import torch, flash_attn; print(torch.cuda.get_device_name(0), flash_attn.__version__)"
+```
 
 ## Data
 
