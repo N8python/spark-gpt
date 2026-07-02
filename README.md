@@ -1,5 +1,7 @@
 # sparkgpt
 
+(Written by Claude Fable 5, with assistance from N8Programs)
+
 A **single-file** byte-level LM pretrainer, tuned for the NVIDIA DGX Spark
 (GB10) but happy on any modern CUDA GPU. Everything lives in
 [train.py](train.py): the model, the optimizer, the data pipeline, distributed
@@ -52,8 +54,17 @@ python -c "import torch, flash_attn; print(torch.cuda.get_device_name(0), flash_
 
 ## Data
 
-One JSONL file, one document per line: `{"text": "..."}`. For example, a 1B-token
-FineWeb slice:
+One JSONL file, one document per line: `{"text": "..."}`.
+
+Ready-made example data (the FineWeb slices the defaults point at, including
+`fineweb_1b.jsonl`) is available at
+[N8Programs/lang_data](https://huggingface.co/datasets/N8Programs/lang_data):
+
+```bash
+hf download N8Programs/lang_data --repo-type dataset --local-dir lang_data
+```
+
+Or build your own slice — e.g. 1B tokens of FineWeb:
 
 ```python
 import json
