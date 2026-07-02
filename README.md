@@ -110,6 +110,9 @@ transfers to any width in the family.
   + step) every N steps, each rank to its own disk; rerun the same command with
   `--resume` after a crash and training rejoins the exact data stream (a
   fingerprint guards against mismatched data/sharding).
+- `--val-path lang_data/fineweb_10m_val_fixed_seed0.jsonl` (the val slice ships
+  with the example data) evaluates a fixed held-out set every 5% of training
+  and at the end — `val/loss` in wandb, `final_val_loss` in `summary.json`.
 - `--save-final` writes `model_final.pt` (native fused layout) and
   `checkpoints/<run>/hf/` — the ready-to-load HF directory (periodic saves get
   `hf_step<N>/` twins on rank 0):

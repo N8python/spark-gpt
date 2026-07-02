@@ -35,7 +35,8 @@ Canonical runs:
   export PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True   # always, on Spark
   # single node (0.6B shape runs ~12.5k tok/s on one GB10):
   python train.py --run-name <name> --train-path lang_data/fineweb_2b.jsonl \
-      --target-tokens 2000000000 --save-final
+      --target-tokens 2000000000 --save-final \
+      --val-path lang_data/fineweb_10m_val_fixed_seed0.jsonl
   # two nodes (run on each node with its own --node-rank; rank 0 is master):
   torchrun --nnodes 2 --node-rank <0|1> --nproc-per-node 1 \
       --master-addr <node0-ip> --master-port 29500 train.py ...
@@ -607,6 +608,14 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--seed", type=int, default=0)
     p.add_argument("--data-seed", type=int, default=None, help="default: --seed")
     p.add_argument("--log-every", type=int, default=50)
+    # validation (off unless --val-path is set; lang_data ships
+    # fineweb_10m_val_fixed_seed0.jsonl for exactly this)
+    p.add_argument("--val-path", default="",
+                   help="held-out jsonl; rank 0 evaluates every --val-interval-frac "
+                        "of training and at the end")
+    p.add_argument("--val-tokens", type=int, default=2_000_000,
+                   help="loss-token budget for the val set (packed like training)")
+    p.add_argument("--val-interval-frac", type=float, default=0.05)
     p.add_argument("--save-final", action="store_true")
     p.add_argument("--save-every", type=int, default=0,
                    help="write a RESUMABLE checkpoint (model+optimizer+scheduler+step) "
@@ -666,6 +675,28 @@ def main() -> None:
         usable = num_windows - num_windows % world_size
         window_order = window_order[rank:usable:world_size]
     steps_total = len(window_order)
+
+    # held-out validation set (rank 0 only): packed into the same fixed windows,
+    # file order (no shuffle) so the metric is stable across runs
+    val_windows: list = []
+    if args.val_path and is_main:
+        vflat, voffsets, vtokens, _ = load_compact_tokenized(
+            Path(args.val_path), target_tokens=args.val_tokens
+        )
+        vin, vtg, vbounds = build_pair_streams(vflat, voffsets)
+        n_vwin = int(vbounds[-1]) // window
+        if n_vwin == 0:
+            raise ValueError(f"--val-path holds fewer than one window ({window} tokens)")
+        for vw in range(n_vwin):
+            lo = vw * window
+            cu, pos = window_metadata(vbounds, vw, window)
+            val_windows.append((vin[lo : lo + window].astype(np.int64),
+                                vtg[lo : lo + window].astype(np.int64), pos, cu))
+        # widen the constant flash bound to cover val segments too
+        val_max_seg = int(min(int(np.diff(vbounds).max()), window))
+        if val_max_seg > args.max_position_embeddings:
+            raise ValueError("longest val segment exceeds --max-position-embeddings")
+        global_max_seqlen = max(global_max_seqlen, val_max_seg)
     data_elapsed = time.perf_counter() - data_start
 
     # ---- model / muP / DDP / compile ----
@@ -751,6 +782,34 @@ def main() -> None:
         loss.backward()
         return loss.detach()
 
+    # val windows live on the GPU for the whole run (~1.2 MB each); rank 1
+    # idles at its next all-reduce while rank 0 evaluates
+    val_gpu = []
+    for vin_w, vtg_w, vpos, vcu in val_windows:
+        ids = torch.from_numpy(vin_w).to(device)
+        tgt = torch.from_numpy(vtg_w).to(device)
+        pos_t = torch.from_numpy(vpos).to(device)
+        cu_t = torch.from_numpy(vcu).to(device)
+        torch._dynamo.mark_dynamic(cu_t, 0)
+        val_gpu.append((ids, tgt, pos_t, cu_t))
+    val_interval = max(1, math.ceil(args.val_interval_frac * steps_total))
+    if val_gpu:
+        print(json.dumps({"event": "val_setup", "val_windows": len(val_gpu),
+                          "val_interval_steps": val_interval}), flush=True)
+
+    @torch.no_grad()
+    def run_val() -> float:
+        model.eval()
+        total_loss, total_toks = 0.0, 0
+        for ids, tgt, pos_t, cu_t in val_gpu:
+            with torch.amp.autocast(device_type="cuda", dtype=torch.bfloat16):
+                logits = model(ids, pos_t, cu_t, global_max_seqlen)
+                loss = F.cross_entropy(logits.float(), tgt, reduction="sum")
+            total_loss += loss.float().item()
+            total_toks += tgt.numel()
+        model.train()
+        return total_loss / max(1, total_toks)
+
     # ---- resume ----
     # The window schedule is deterministic (data_seed + fingerprint below), so a
     # checkpoint only needs the per-rank step count to rejoin the exact stream.
@@ -820,6 +879,7 @@ def main() -> None:
     total_tokens = start_step * window  # includes pre-resume tokens
     session_start_tokens = total_tokens  # rates count this session only
     last_log_time, last_log_tokens = started_at, total_tokens
+    last_val_loss = None
     metrics_file = (run_dir / "metrics.jsonl").open(
         "a" if start_step else "w", encoding="utf-8") if is_main else None
 
@@ -867,6 +927,19 @@ def main() -> None:
                     })
             last_log_time, last_log_tokens = now, total_tokens
 
+        if val_gpu and (step % val_interval == 0 or step == steps_total):
+            v_loss = run_val()
+            last_val_loss = v_loss
+            vrec = {"event": "validation", "step": step, "total_steps": steps_total,
+                    "val_loss": v_loss,
+                    "elapsed_seconds": time.perf_counter() - started_at}
+            print(json.dumps(vrec), flush=True)
+            metrics_file.write(json.dumps(vrec) + "\n")
+            metrics_file.flush()
+            if wandb_run is not None:
+                wandb_run.log({"val/loss": v_loss, "train/step": step,
+                               "train/tokens": total_tokens * world_size})
+
         if args.save_every and step % args.save_every == 0:
             save_resumable(step)  # every rank, to its own disk
             if is_main:
@@ -884,6 +957,8 @@ def main() -> None:
         "peak_cuda_memory_gb": torch.cuda.max_memory_allocated() / 1024**3,
         "world_size": world_size,
     }
+    if last_val_loss is not None:
+        finished["final_val_loss"] = last_val_loss
     if is_main:
         metrics_file.close()
         if args.save_final:
