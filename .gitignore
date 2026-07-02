@@ -1,0 +1,5 @@
+checkpoints/
+lang_data/
+wandb/
+*.log
+__pycache__/
