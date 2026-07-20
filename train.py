@@ -66,8 +66,11 @@ import json
 import math
 import os
 import random
+import sys
+import threading
 import time
 from dataclasses import asdict, dataclass
+from datetime import timedelta
 from pathlib import Path
 
 os.environ.setdefault("WANDB_SILENT", "true")
@@ -574,6 +577,39 @@ def cosine_with_warmup(step, *, warmup_steps, total_steps, min_lr_ratio):
 # --------------------------------------------------------------------------- #
 # Trainer
 # --------------------------------------------------------------------------- #
+def finish_wandb_with_timeout(wandb_run, timeout_seconds: float) -> bool:
+    """Finish W&B without allowing its helper process to wedge the trainer.
+
+    W&B finalization can wait indefinitely for wandb-core even after the core
+    reports that all files were uploaded.  Run it on a daemon thread so the
+    successful training process retains control of its own shutdown.
+    """
+    done = threading.Event()
+    errors: list[BaseException] = []
+
+    def finish() -> None:
+        try:
+            wandb_run.finish()
+        except BaseException as exc:  # report after the thread hands control back
+            errors.append(exc)
+        finally:
+            done.set()
+
+    thread = threading.Thread(target=finish, name="wandb-finish", daemon=True)
+    thread.start()
+    if not done.wait(timeout_seconds):
+        print(json.dumps({"event": "wandb_finish_timeout",
+                          "timeout_seconds": timeout_seconds}),
+              file=sys.__stderr__, flush=True)
+        return False
+    if errors:
+        print(json.dumps({"event": "wandb_finish_error",
+                          "error": repr(errors[0])}),
+              file=sys.__stderr__, flush=True)
+        return False
+    return True
+
+
 def parse_args() -> argparse.Namespace:
     p = argparse.ArgumentParser(description="sparkgpt: DDP muP byte-level packed pretrainer.")
     p.add_argument("--train-path", default="lang_data/fineweb_1b.jsonl")
@@ -608,6 +644,8 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--seed", type=int, default=0)
     p.add_argument("--data-seed", type=int, default=None, help="default: --seed")
     p.add_argument("--log-every", type=int, default=50)
+    p.add_argument("--ddp-timeout-seconds", type=int, default=300,
+                   help="maximum wait for any DDP collective, including teardown")
     # validation (off unless --val-path is set; lang_data ships
     # fineweb_10m_val_fixed_seed0.jsonl for exactly this)
     p.add_argument("--val-path", default="",
@@ -629,6 +667,8 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--wandb-entity", default="")
     p.add_argument("--wandb-run-name", default="")
     p.add_argument("--wandb-tags", default="")
+    p.add_argument("--wandb-finish-timeout-seconds", type=float, default=30.0,
+                   help="maximum wait for wandb-core after training has completed")
     return p.parse_args()
 
 
@@ -636,6 +676,10 @@ def main() -> None:
     args = parse_args()
     if args.attention_heads % args.kv_heads != 0:
         raise ValueError("--attention-heads must be divisible by --kv-heads")
+    if args.ddp_timeout_seconds <= 0:
+        raise ValueError("--ddp-timeout-seconds must be positive")
+    if args.wandb_finish_timeout_seconds <= 0:
+        raise ValueError("--wandb-finish-timeout-seconds must be positive")
     data_seed = args.data_seed if args.data_seed is not None else args.seed
 
     rank = int(os.environ.get("RANK", "0"))
@@ -646,7 +690,10 @@ def main() -> None:
         raise RuntimeError("sparkgpt requires CUDA (flash_attn varlen)")
     if distributed:
         torch.cuda.set_device(0)  # one GPU per Spark node
-        dist.init_process_group("nccl", device_id=torch.device("cuda:0"))
+        dist.init_process_group(
+            "nccl", device_id=torch.device("cuda:0"),
+            timeout=timedelta(seconds=args.ddp_timeout_seconds),
+        )
     device = torch.device("cuda")
 
     torch.manual_seed(args.seed)  # same seed on every rank -> identical init
@@ -715,7 +762,12 @@ def main() -> None:
                                  emb_std=args.mup_emb_std, hidden_std=args.mup_hidden_std)
     raw_model = model  # for checkpointing
     if distributed:
-        model = torch.nn.parallel.DistributedDataParallel(model, device_ids=[0])
+        # RoPE caches are immutable and deterministically identical on every
+        # rank, so broadcasting them before every forward is unnecessary.  It
+        # is also dangerous for rank-0-only validation (see run_val below).
+        model = torch.nn.parallel.DistributedDataParallel(
+            model, device_ids=[0], broadcast_buffers=False,
+        )
     if args.compile:
         model = torch.compile(model, mode="default", dynamic=False)
     optimizer, optimizer_summary = build_optimizer(model, args)
@@ -782,8 +834,10 @@ def main() -> None:
         loss.backward()
         return loss.detach()
 
-    # val windows live on the GPU for the whole run (~1.2 MB each); rank 1
-    # idles at its next all-reduce while rank 0 evaluates
+    # Val windows live on the GPU for the whole run (~1.2 MB each).  Validation
+    # is rank 0 only and MUST bypass the DDP wrapper: otherwise its forward-time
+    # buffer broadcasts collide with rank 1's next training/teardown collective.
+    # Rank 1 safely waits at its next DDP collective while rank 0 evaluates.
     val_gpu = []
     for vin_w, vtg_w, vpos, vcu in val_windows:
         ids = torch.from_numpy(vin_w).to(device)
@@ -799,15 +853,15 @@ def main() -> None:
 
     @torch.no_grad()
     def run_val() -> float:
-        model.eval()
+        raw_model.eval()
         total_loss, total_toks = 0.0, 0
         for ids, tgt, pos_t, cu_t in val_gpu:
             with torch.amp.autocast(device_type="cuda", dtype=torch.bfloat16):
-                logits = model(ids, pos_t, cu_t, global_max_seqlen)
+                logits = raw_model(ids, pos_t, cu_t, global_max_seqlen)
                 loss = F.cross_entropy(logits.float(), tgt, reduction="sum")
             total_loss += loss.float().item()
             total_toks += tgt.numel()
-        model.train()
+        raw_model.train()
         return total_loss / max(1, total_toks)
 
     # ---- resume ----
@@ -959,6 +1013,19 @@ def main() -> None:
     }
     if last_val_loss is not None:
         finished["final_val_loss"] = last_val_loss
+
+    # Tear DDP down while every rank is at the same point, before rank 0 enters
+    # checkpoint export or W&B finalization.  Previously rank 1 waited in this
+    # barrier while rank 0 called wandb.finish(); a wedged wandb-core therefore
+    # kept both torchrun jobs (and both GPUs) alive forever.
+    if distributed:
+        print(json.dumps({"event": "ddp_teardown_start", "rank": rank}), flush=True)
+        try:
+            dist.barrier()
+        finally:
+            dist.destroy_process_group()
+        print(json.dumps({"event": "ddp_teardown_complete", "rank": rank}), flush=True)
+
     if is_main:
         metrics_file.close()
         if args.save_final:
@@ -969,10 +1036,14 @@ def main() -> None:
         if wandb_run is not None:
             wandb_run.log({"final/tokens_per_sec": finished["global_tokens_per_second"],
                            "train/tokens": finished["global_total_tokens"]})
-            wandb_run.finish()
-    if distributed:
-        dist.barrier()
-        dist.destroy_process_group()
+            if not finish_wandb_with_timeout(
+                    wandb_run, args.wandb_finish_timeout_seconds):
+                # All artifacts are durable and DDP is already gone.  Bypass
+                # W&B's atexit hook/non-daemon threads so torchrun sees a clean
+                # successful worker exit rather than another indefinite wait.
+                sys.stdout.flush()
+                sys.stderr.flush()
+                os._exit(0)
 
 
 if __name__ == "__main__":
