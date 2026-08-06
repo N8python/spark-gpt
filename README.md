@@ -131,7 +131,8 @@ unified memory; `max-autotune` is ~6.5% slower than `default` on sm_121), fp8
 matmuls are a net loss below ~2048 hidden dim (dynamic-scaling casts are
 bandwidth-bound), and always set
 `PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True`. At the 0.6B shape the
-trainer sustains ~12.5k tok/s (~41% MFU) on a single GB10.
+trainer sustains ~14.0k tok/s on a single GB10 at the default 49,152-token
+window (torch 2.12.0+cu130, flash-attn 2.8.3.post1).
 
 ## License
 

@@ -33,7 +33,7 @@ kv = heads/2, MLP = 3*dim); the Qwen3-0.6B shape (440.7M params) is:
 Canonical runs:
 
   export PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True   # always, on Spark
-  # single node (0.6B shape runs ~12.5k tok/s on one GB10):
+  # single node (0.6B shape runs ~14.0k tok/s on one GB10):
   python train.py --run-name <name> --train-path lang_data/fineweb_2b.jsonl \
       --target-tokens 2000000000 --save-final \
       --val-path lang_data/fineweb_10m_val_fixed_seed0.jsonl
@@ -46,6 +46,9 @@ Hard-won GB10 (sm_121) facts -- do not relearn these:
     memory, and max-autotune is ~6.5% SLOWER than default (triton < cuBLAS).
   * fp8 is a net loss at dim 1024 (dynamic-scaling casts are bandwidth-bound;
     273 GB/s). Revisit at dim >= 2048.
+  * Embedding is not autocast by PyTorch. Cast its output to the active
+    autocast dtype once or every residual add promotes back to fp32; keeping
+    the 0.6B residual stream in bf16 improved throughput by ~9% on GB10.
   * torch.compile traps: max_seqlen must be a CONSTANT python int and
     cu_seqlens' varying length must be mark_dynamic'd, else a silent
     recompile-limit eager fallback costs 2x throughput and +30 GB.
@@ -215,8 +218,22 @@ class ByteLM(nn.Module):
 
     def forward(self, input_ids, position_ids, cu_seqlens, max_seqlen):
         x = self.embed_tokens(input_ids)
-        cos = self.cos_cached[position_ids]
-        sin = self.sin_cached[position_ids]
+        autocast_enabled = torch.is_autocast_enabled(x.device.type)
+        rope_dtype = (
+            torch.get_autocast_dtype(x.device.type)
+            if autocast_enabled else x.dtype
+        )
+        # Embedding is not autocast by PyTorch.  Keeping its fp32 output would
+        # promote every residual add back to fp32, doubling activation traffic
+        # despite the rest of training being bf16.  Enter the configured
+        # autocast dtype once so the residual stream follows the requested
+        # mixed-precision policy; non-autocast callers retain fp32 behavior.
+        if autocast_enabled:
+            x = x.to(dtype=rope_dtype)
+        # Every attention layer consumes the same RoPE rows.  Cast them once
+        # rather than recasting both tables for q and k in every layer.
+        cos = self.cos_cached[position_ids].to(dtype=rope_dtype)
+        sin = self.sin_cached[position_ids].to(dtype=rope_dtype)
         for layer in self.layers:
             x = layer(x, cos, sin, cu_seqlens, max_seqlen)
         return self.lm_head(self.norm(x))
@@ -419,11 +436,16 @@ class MuonAdamWHybrid(torch.optim.Optimizer):
             if "v" not in state:
                 state["v"] = torch.zeros_like(p, dtype=torch.float32)
             vs.append(state["v"])
-        torch._foreach_mul_(vs, momentum)
-        torch._foreach_add_(vs, grads, alpha=1 - momentum)
+        # lerp evaluates the same momentum recurrences in one multi-tensor
+        # pass instead of a multiply pass followed by an add pass.
+        torch._foreach_lerp_(vs, grads, 1 - momentum)
         if group["nesterov"]:
-            updates = torch._foreach_mul(grads, 1 - momentum)
-            torch._foreach_add_(updates, vs, alpha=momentum)
+            # Gradients are dead after optimizer.step (the trainer clears them
+            # before the next forward), so reuse their storage for the
+            # Nesterov update instead of allocating another full model-sized
+            # fp32 tensor list.
+            updates = grads
+            torch._foreach_lerp_(updates, vs, momentum)
         else:
             updates = [v.clone() for v in vs]
 
@@ -431,14 +453,19 @@ class MuonAdamWHybrid(torch.optim.Optimizer):
         for p, u in zip(params, updates):
             by_shape.setdefault(tuple(u.shape), []).append((p, u))
         for (rows, cols), items in by_shape.items():
-            # NS in bf16 (fp32 matmul is slow on GB10; NS is approximate anyway)
-            stacked = torch.stack([u for _, u in items]).bfloat16()
+            # Stack directly into the bf16 NS input.  The previous fp32 stack
+            # followed by a cast made an avoidable model-sized intermediate.
+            stacked = torch.empty(
+                (len(items), rows, cols), device=items[0][1].device,
+                dtype=torch.bfloat16,
+            )
+            torch.stack([u for _, u in items], out=stacked)
             ortho = _newtonschulz5_batched(stacked, steps=group["ns_steps"])
             # aspect-ratio factor; also what makes Muon lr width-invariant
             lr = group["lr"] * max(1, rows / cols) ** 0.5
             torch._foreach_add_(
                 [p for p, _ in items],
-                [o.to(p.dtype) for (p, _), o in zip(items, ortho.unbind(0))],
+                list(ortho.unbind(0)),
                 alpha=-lr,
             )
 
