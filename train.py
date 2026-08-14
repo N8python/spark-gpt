@@ -3,11 +3,11 @@
 One file, one recipe. Qwen3-shaped decoder over raw UTF-8 bytes (vocab 259:
 256 bytes + BOS/EOS/PAD), trained with:
 
-  * Varlen sequence packing -- every batch is exactly --tokens-per-batch loss
-    tokens (one static shape, zero padding). Attention is flash-varlen with
-    cu_seqlens at document boundaries: block-diagonal, NO inter-document
-    attention, RoPE restarts per segment. Docs cut by a window boundary
-    continue as fresh segments (truncated context, never cross-window).
+  * Whole-document varlen packing -- every batch has the same static
+    --tokens-per-batch shape, but document boundaries are NEVER cut. Unused
+    tail positions are PAD filler with ignored loss targets. Attention is
+    flash-varlen and block-diagonal at document/filler boundaries: no
+    inter-document attention, and RoPE restarts per segment.
   * muP width scaling (always on). Base hparams are defined at width
     --mup-base-dim (256) and transfer: hidden init 0.02*sqrt(base/width),
     residual writers (o/down) get an extra 1/sqrt(2L), embedding std constant,
@@ -18,7 +18,7 @@ One file, one recipe. Qwen3-shaped decoder over raw UTF-8 bytes (vocab 259:
     across the width family.
   * Muon/AdamW hybrid (always). 2-D body matrices -> Muon (NO weight decay);
     embedding, lm_head, norm gains -> AdamW.
-  * DDP across Spark nodes via torchrun; windows are sharded round-robin by
+  * DDP across Spark nodes via torchrun; packed batches are sharded round-robin by
     rank. Single-process runs need no torchrun.
 
 Defaults are a Chinchilla-optimal 50M run: 50M model (16L / 512d / 4Q+2KV
@@ -88,6 +88,8 @@ from flash_attn import flash_attn_varlen_func
 
 BOS, EOS, PAD = 256, 257, 258
 VOCAB_SIZE = 259
+LOSS_IGNORE_INDEX = -100
+PACKING_FORMAT = "whole_document_static_v1"
 
 
 # --------------------------------------------------------------------------- #
@@ -530,7 +532,7 @@ def build_optimizer(model: torch.nn.Module, args: argparse.Namespace):
 
 
 # --------------------------------------------------------------------------- #
-# Data: compact byte stream -> per-doc pair streams -> fixed windows
+# Data: compact byte stream -> per-doc pair streams -> fixed-shape batches
 # --------------------------------------------------------------------------- #
 def load_compact_tokenized(path: Path, *, target_tokens: int | None,
                            flush_tokens: int = 200_000_000):
@@ -579,19 +581,98 @@ def build_pair_streams(flat: np.ndarray, offsets: list[int]):
     return flat[keep_in], flat[keep_tg], bounds
 
 
-def window_metadata(bounds: np.ndarray, w: int, window: int):
-    """cu_seqlens / position_ids for window w. Segments = doc boundaries plus
-    window edges; a doc cut by the edge restarts as a fresh segment."""
-    lo, hi = w * window, (w + 1) * window
-    i0 = np.searchsorted(bounds, lo, side="right")
-    i1 = np.searchsorted(bounds, hi, side="left")
-    cu = np.empty(i1 - i0 + 2, dtype=np.int32)
-    cu[0] = 0
-    cu[1:-1] = bounds[i0:i1] - lo
-    cu[-1] = hi - lo
+@dataclass(frozen=True)
+class PackedBatch:
+    """A consecutive, whole-document span placed in one static batch."""
+
+    start_doc: int
+    end_doc: int
+    real_tokens: int
+
+
+def build_whole_document_batches(bounds: np.ndarray, window: int) -> list[PackedBatch]:
+    """Sequential next-fit packing without ever splitting a document.
+
+    The returned batches describe only real pair-stream tokens. Materialization
+    adds ignored PAD filler to reach ``window``. Keeping the plan as document
+    spans avoids materializing a second, padded copy of a multi-billion-token
+    corpus in host memory.
+    """
+    bounds = np.asarray(bounds, dtype=np.int64)
+    if window <= 0:
+        raise ValueError("window must be positive")
+    if bounds.ndim != 1 or bounds.size < 2 or bounds[0] != 0:
+        raise ValueError("bounds must be a 1-D cumulative array starting at zero")
+    lengths = np.diff(bounds)
+    if np.any(lengths <= 0):
+        raise ValueError("every document must contribute at least one loss token")
+    longest = int(lengths.max())
+    if longest > window:
+        doc = int(np.argmax(lengths))
+        raise ValueError(
+            f"document {doc} has {longest} loss tokens, exceeding "
+            f"--tokens-per-batch ({window}); whole-document packing will not split it"
+        )
+
+    batches: list[PackedBatch] = []
+    start_doc = 0
+    used = 0
+    for doc, length_np in enumerate(lengths):
+        length = int(length_np)
+        if used and used + length > window:
+            batches.append(PackedBatch(start_doc, doc, used))
+            start_doc = doc
+            used = 0
+        used += length
+    if used:
+        batches.append(PackedBatch(start_doc, len(lengths), used))
+    return batches
+
+
+def packed_batch_metadata(bounds: np.ndarray, batch: PackedBatch, window: int,
+                          max_segment_length: int):
+    """Build fixed-shape cu_seqlens and RoPE positions for a packed batch.
+
+    Filler is split into one or more isolated segments so its positions and
+    flash-attn ``max_seqlen`` never exceed the real-data model limit. Its loss
+    is ignored, and separating it from the final document prevents PAD tokens
+    from changing any real-token activation.
+    """
+    if max_segment_length <= 0:
+        raise ValueError("max_segment_length must be positive")
+    local = np.asarray(
+        bounds[batch.start_doc : batch.end_doc + 1], dtype=np.int64
+    ) - int(bounds[batch.start_doc])
+    if int(local[-1]) != batch.real_tokens or batch.real_tokens > window:
+        raise ValueError("packed batch plan does not match document bounds")
+    cu_list = local.tolist()
+    remaining = window - batch.real_tokens
+    while remaining:
+        chunk = min(remaining, max_segment_length)
+        cu_list.append(cu_list[-1] + chunk)
+        remaining -= chunk
+    cu = np.asarray(cu_list, dtype=np.int32)
     seg_lens = np.diff(cu)
     pos = np.arange(window, dtype=np.int64) - np.repeat(cu[:-1].astype(np.int64), seg_lens)
     return cu, pos
+
+
+def materialize_packed_batch(inputs: np.ndarray, targets: np.ndarray,
+                             bounds: np.ndarray, batch: PackedBatch, window: int,
+                             max_segment_length: int):
+    """Return static-shape arrays; only the prefix contains loss-bearing data."""
+    lo = int(bounds[batch.start_doc])
+    hi = int(bounds[batch.end_doc])
+    if hi - lo != batch.real_tokens:
+        raise ValueError("packed batch token count does not match source span")
+    ids = np.full(window, PAD, dtype=np.int64)
+    tgt = np.full(window, LOSS_IGNORE_INDEX, dtype=np.int64)
+    ids[:batch.real_tokens] = inputs[lo:hi]
+    tgt[:batch.real_tokens] = targets[lo:hi]
+    cu, pos = packed_batch_metadata(
+        bounds, batch, window, max_segment_length
+    )
+    return ids, tgt, pos, cu
 
 
 def cosine_with_warmup(step, *, warmup_steps, total_steps, min_lr_ratio):
@@ -736,41 +817,51 @@ def main() -> None:
     )
     inputs_np, targets_np, bounds = build_pair_streams(flat, offsets)
     window = args.tokens_per_batch
-    total_pairs = int(bounds[-1])
-    num_windows = total_pairs // window
     max_doc_pairs = int(np.diff(bounds).max())
-    global_max_seqlen = int(min(max_doc_pairs, window))  # CONSTANT (compile trap)
+    train_batches = build_whole_document_batches(bounds, window)
+    global_max_seqlen = max_doc_pairs  # CONSTANT (compile trap)
     if global_max_seqlen > args.max_position_embeddings:
         raise ValueError(f"longest packed segment ({global_max_seqlen}) exceeds "
                          f"--max-position-embeddings ({args.max_position_embeddings})")
-    window_order = list(range(num_windows))
-    random.Random(data_seed + 1).shuffle(window_order)
-    if distributed:  # round-robin shard; every rank gets the same step count
-        usable = num_windows - num_windows % world_size
-        window_order = window_order[rank:usable:world_size]
+    global_batch_order = list(range(len(train_batches)))
+    random.Random(data_seed + 1).shuffle(global_batch_order)
+    # Pad the global schedule, rather than dropping a real batch, so every rank
+    # executes the same number of DDP steps and every selected document trains.
+    # A -1 slot materializes as an all-PAD, zero-real-token batch; at least one
+    # other rank has real tokens in that final step.
+    ddp_filler_batches = (-len(global_batch_order)) % world_size
+    global_batch_order.extend([-1] * ddp_filler_batches)
+    scheduled_batches = len(global_batch_order)
+    window_order = global_batch_order[rank::world_size]
     steps_total = len(window_order)
+    training_real_tokens = sum(batch.real_tokens for batch in train_batches)
+    training_compute_tokens = scheduled_batches * window
+    packing_utilization = training_real_tokens / training_compute_tokens
 
-    # held-out validation set (rank 0 only): packed into the same fixed windows,
-    # file order (no shuffle) so the metric is stable across runs
+    # Held-out validation set (rank 0 only): whole-document packed in file order
+    # so the metric is stable across runs.
     val_windows: list = []
     if args.val_path and is_main:
-        vflat, voffsets, vtokens, _ = load_compact_tokenized(
+        vflat, voffsets, _, _ = load_compact_tokenized(
             Path(args.val_path), target_tokens=args.val_tokens
         )
         vin, vtg, vbounds = build_pair_streams(vflat, voffsets)
-        n_vwin = int(vbounds[-1]) // window
-        if n_vwin == 0:
-            raise ValueError(f"--val-path holds fewer than one window ({window} tokens)")
-        for vw in range(n_vwin):
-            lo = vw * window
-            cu, pos = window_metadata(vbounds, vw, window)
-            val_windows.append((vin[lo : lo + window].astype(np.int64),
-                                vtg[lo : lo + window].astype(np.int64), pos, cu))
-        # widen the constant flash bound to cover val segments too
-        val_max_seg = int(min(int(np.diff(vbounds).max()), window))
+        val_batches = build_whole_document_batches(vbounds, window)
+        val_max_seg = int(np.diff(vbounds).max())
         if val_max_seg > args.max_position_embeddings:
             raise ValueError("longest val segment exceeds --max-position-embeddings")
         global_max_seqlen = max(global_max_seqlen, val_max_seg)
+        for val_batch in val_batches:
+            ids, tgt, pos, cu = materialize_packed_batch(
+                vin, vtg, vbounds, val_batch, window, global_max_seqlen
+            )
+            val_windows.append((ids, tgt, pos, cu, val_batch.real_tokens))
+    if distributed:
+        # Rank 0 may have widened this for validation. Keep the Python constant
+        # identical on every rank so training compiles the same graph/kernel.
+        max_seqlen_t = torch.tensor(global_max_seqlen, device=device, dtype=torch.int64)
+        dist.broadcast(max_seqlen_t, src=0)
+        global_max_seqlen = int(max_seqlen_t.item())
     data_elapsed = time.perf_counter() - data_start
 
     # ---- model / muP / DDP / compile ----
@@ -819,7 +910,14 @@ def main() -> None:
         "cuda_device": torch.cuda.get_device_name(0),
         "selected_docs": num_docs,
         "selected_loss_tokens": selected_tokens,
+        "packing_format": PACKING_FORMAT,
         "window_tokens": window,
+        "packed_real_batches": len(train_batches),
+        "ddp_filler_batches": ddp_filler_batches,
+        "scheduled_batches": scheduled_batches,
+        "real_tokens_used": training_real_tokens,
+        "padding_compute_tokens": training_compute_tokens - training_real_tokens,
+        "packing_utilization": packing_utilization,
         "steps_per_rank": steps_total,
         "warmup_steps": warmup_steps,
         "world_size": world_size,
@@ -844,35 +942,46 @@ def main() -> None:
         wandb.define_metric("*", step_metric="train/tokens")
 
     def batch_for(w: int):
-        lo = w * window
-        cu, pos = window_metadata(bounds, w, window)
-        ids = torch.from_numpy(inputs_np[lo : lo + window].astype(np.int64)).to(device, non_blocking=True)
-        tgt = torch.from_numpy(targets_np[lo : lo + window].astype(np.int64)).to(device, non_blocking=True)
+        packed = train_batches[w] if w >= 0 else PackedBatch(0, 0, 0)
+        ids_np, tgt_np, pos, cu = materialize_packed_batch(
+            inputs_np, targets_np, bounds, packed, window, global_max_seqlen
+        )
+        ids = torch.from_numpy(ids_np).to(device, non_blocking=True)
+        tgt = torch.from_numpy(tgt_np).to(device, non_blocking=True)
         pos_t = torch.from_numpy(pos).to(device, non_blocking=True)
         cu_t = torch.from_numpy(cu).to(device, non_blocking=True)
         torch._dynamo.mark_dynamic(cu_t, 0)  # varying segment count (compile trap)
-        return ids, tgt, pos_t, cu_t
+        return ids, tgt, pos_t, cu_t, packed.real_tokens
 
     def forward_backward(w: int):
-        ids, tgt, pos_t, cu_t = batch_for(w)
+        ids, tgt, pos_t, cu_t, real_tokens = batch_for(w)
         with torch.amp.autocast(device_type="cuda", dtype=torch.bfloat16):
             logits = model(ids, pos_t, cu_t, global_max_seqlen)
-            loss = F.cross_entropy(logits.float(), tgt)
-        loss.backward()
-        return loss.detach()
+            loss_sum = F.cross_entropy(
+                logits.float(), tgt, ignore_index=LOSS_IGNORE_INDEX, reduction="sum"
+            )
+        # Packed batches contain different numbers of real targets. DDP averages
+        # gradients across ranks, so compensate by world_size/global_tokens to
+        # make the result exactly the global token-mean gradient.
+        global_tokens_t = torch.tensor(real_tokens, device=device, dtype=torch.int64)
+        if distributed:
+            dist.all_reduce(global_tokens_t, op=dist.ReduceOp.SUM)
+        scaled_loss = loss_sum * world_size / global_tokens_t.to(loss_sum.dtype)
+        scaled_loss.backward()
+        return loss_sum.detach(), real_tokens, int(global_tokens_t.item())
 
     # Val windows live on the GPU for the whole run (~1.2 MB each).  Validation
     # is rank 0 only and MUST bypass the DDP wrapper: otherwise its forward-time
     # buffer broadcasts collide with rank 1's next training/teardown collective.
     # Rank 1 safely waits at its next DDP collective while rank 0 evaluates.
     val_gpu = []
-    for vin_w, vtg_w, vpos, vcu in val_windows:
+    for vin_w, vtg_w, vpos, vcu, vreal in val_windows:
         ids = torch.from_numpy(vin_w).to(device)
         tgt = torch.from_numpy(vtg_w).to(device)
         pos_t = torch.from_numpy(vpos).to(device)
         cu_t = torch.from_numpy(vcu).to(device)
         torch._dynamo.mark_dynamic(cu_t, 0)
-        val_gpu.append((ids, tgt, pos_t, cu_t))
+        val_gpu.append((ids, tgt, pos_t, cu_t, vreal))
     val_interval = max(1, math.ceil(args.val_interval_frac * steps_total))
     if val_gpu:
         print(json.dumps({"event": "val_setup", "val_windows": len(val_gpu),
@@ -882,17 +991,19 @@ def main() -> None:
     def run_val() -> float:
         raw_model.eval()
         total_loss, total_toks = 0.0, 0
-        for ids, tgt, pos_t, cu_t in val_gpu:
+        for ids, tgt, pos_t, cu_t, real_tokens in val_gpu:
             with torch.amp.autocast(device_type="cuda", dtype=torch.bfloat16):
                 logits = raw_model(ids, pos_t, cu_t, global_max_seqlen)
-                loss = F.cross_entropy(logits.float(), tgt, reduction="sum")
+                loss = F.cross_entropy(
+                    logits.float(), tgt, ignore_index=LOSS_IGNORE_INDEX, reduction="sum"
+                )
             total_loss += loss.float().item()
-            total_toks += tgt.numel()
+            total_toks += real_tokens
         raw_model.train()
         return total_loss / max(1, total_toks)
 
     # ---- resume ----
-    # The window schedule is deterministic (data_seed + fingerprint below), so a
+    # The packed-batch schedule is deterministic (data_seed + fingerprint below), so a
     # checkpoint only needs the per-rank step count to rejoin the exact stream.
     # Every rank writes/reads its OWN local copy (no shared fs across Sparks);
     # model/optimizer states are identical across ranks by DDP construction.
@@ -900,6 +1011,10 @@ def main() -> None:
         "train_path": args.train_path,
         "selected_tokens": selected_tokens,
         "window": window,
+        "packing_format": PACKING_FORMAT,
+        "scheduled_batches": scheduled_batches,
+        "ddp_filler_batches": ddp_filler_batches,
+        "real_tokens_used": training_real_tokens,
         "data_seed": data_seed,
         "world_size": world_size,
         "steps_total": steps_total,
@@ -945,7 +1060,10 @@ def main() -> None:
     model.train()
     if remaining:
         prewarm_start = time.perf_counter()
-        warm_loss = forward_backward(remaining[0])
+        warm_loss_sum, _, warm_global_tokens = forward_backward(remaining[0])
+        if distributed:
+            dist.all_reduce(warm_loss_sum, op=dist.ReduceOp.SUM)
+        warm_loss = warm_loss_sum / warm_global_tokens
         model.zero_grad(set_to_none=True)
         torch.cuda.synchronize()
         if is_main:
@@ -957,40 +1075,61 @@ def main() -> None:
     torch.cuda.reset_peak_memory_stats()
     torch.cuda.synchronize()
     started_at = time.perf_counter()
-    total_tokens = start_step * window  # includes pre-resume tokens
-    session_start_tokens = total_tokens  # rates count this session only
-    last_log_time, last_log_tokens = started_at, total_tokens
+    local_total_tokens = sum(
+        train_batches[w].real_tokens for w in window_order[:start_step] if w >= 0
+    )
+    global_total_tokens_t = torch.tensor(
+        local_total_tokens, device=device, dtype=torch.int64
+    )
+    if distributed:
+        dist.all_reduce(global_total_tokens_t, op=dist.ReduceOp.SUM)
+    global_total_tokens = int(global_total_tokens_t.item())
+    global_compute_tokens = start_step * window * world_size
+    session_start_global_tokens = global_total_tokens
+    session_start_compute_tokens = global_compute_tokens
+    last_log_time = started_at
+    last_log_global_tokens = global_total_tokens
+    last_log_compute_tokens = global_compute_tokens
     last_val_loss = None
     metrics_file = (run_dir / "metrics.jsonl").open(
         "a" if start_step else "w", encoding="utf-8") if is_main else None
 
     for step, w in enumerate(remaining, start=start_step + 1):
         optimizer.zero_grad(set_to_none=True)
-        loss = forward_backward(w)
+        loss_sum, local_step_tokens, global_step_tokens = forward_backward(w)
         optimizer.step()
         scheduler.step()
-        total_tokens += window
+        local_total_tokens += local_step_tokens
+        global_total_tokens += global_step_tokens
+        global_compute_tokens += window * world_size
 
         if step == 1 or step % args.log_every == 0 or step == steps_total:
             torch.cuda.synchronize()
             now = time.perf_counter()
-            global_tokens = total_tokens * world_size  # exact: fixed window size
-            if distributed:  # sync loss across ranks for a stable log signal
-                loss = loss.clone()
-                dist.all_reduce(loss)
-                loss /= world_size
+            if distributed:  # exact token-weighted loss across ranks
+                dist.all_reduce(loss_sum, op=dist.ReduceOp.SUM)
+            loss = loss_sum / global_step_tokens
             if is_main:
                 record = {
                     "step": step,
                     "total_steps": steps_total,
                     "loss": float(loss.float().item()),
-                    "total_tokens": total_tokens,
-                    "global_total_tokens": global_tokens,
+                    "total_tokens": local_total_tokens,
+                    "global_total_tokens": global_total_tokens,
+                    "global_compute_tokens": global_compute_tokens,
                     "elapsed_seconds": now - started_at,
-                    "window_tokens_per_second": (total_tokens - last_log_tokens) * world_size
-                    / max(1e-9, now - last_log_time),
-                    "global_tokens_per_second": (total_tokens - session_start_tokens)
-                    * world_size / max(1e-9, now - started_at),
+                    "window_tokens_per_second":
+                        (global_compute_tokens - last_log_compute_tokens)
+                        / max(1e-9, now - last_log_time),
+                    "real_tokens_per_second":
+                        (global_total_tokens - last_log_global_tokens)
+                        / max(1e-9, now - last_log_time),
+                    "global_tokens_per_second":
+                        (global_total_tokens - session_start_global_tokens)
+                        / max(1e-9, now - started_at),
+                    "observed_packing_utilization":
+                        (global_total_tokens - session_start_global_tokens)
+                        / max(1, global_compute_tokens - session_start_compute_tokens),
                     "lr": optimizer.param_groups[0]["lr"],
                     "peak_cuda_memory_gb": torch.cuda.max_memory_allocated() / 1024**3,
                 }
@@ -1000,13 +1139,17 @@ def main() -> None:
                 if wandb_run is not None:
                     wandb_run.log({
                         "train/loss": record["loss"],
-                        "train/tokens_per_sec": record["window_tokens_per_second"],
+                        "train/tokens_per_sec": record["real_tokens_per_second"],
+                        "train/compute_tokens_per_sec": record["window_tokens_per_second"],
+                        "train/packing_utilization": record["observed_packing_utilization"],
                         "train/lr": record["lr"],
                         "train/peak_cuda_memory_gb": record["peak_cuda_memory_gb"],
                         "train/step": step,
-                        "train/tokens": global_tokens,
+                        "train/tokens": global_total_tokens,
                     })
-            last_log_time, last_log_tokens = now, total_tokens
+            last_log_time = now
+            last_log_global_tokens = global_total_tokens
+            last_log_compute_tokens = global_compute_tokens
 
         if val_gpu and (step % val_interval == 0 or step == steps_total):
             v_loss = run_val()
@@ -1019,7 +1162,7 @@ def main() -> None:
             metrics_file.flush()
             if wandb_run is not None:
                 wandb_run.log({"val/loss": v_loss, "train/step": step,
-                               "train/tokens": total_tokens * world_size})
+                               "train/tokens": global_total_tokens})
 
         if args.save_every and step % args.save_every == 0:
             save_resumable(step)  # every rank, to its own disk
@@ -1031,10 +1174,14 @@ def main() -> None:
     finished = {
         "event": "finished",
         "elapsed_seconds": elapsed,
-        "total_tokens": total_tokens,
-        "global_total_tokens": total_tokens * world_size,
-        "global_tokens_per_second": (total_tokens - session_start_tokens)
-        * world_size / max(1e-9, elapsed),
+        "total_tokens": local_total_tokens,
+        "global_total_tokens": global_total_tokens,
+        "global_compute_tokens": global_compute_tokens,
+        "global_tokens_per_second":
+            (global_total_tokens - session_start_global_tokens) / max(1e-9, elapsed),
+        "global_compute_tokens_per_second":
+            (global_compute_tokens - session_start_compute_tokens) / max(1e-9, elapsed),
+        "packing_utilization": packing_utilization,
         "peak_cuda_memory_gb": torch.cuda.max_memory_allocated() / 1024**3,
         "world_size": world_size,
     }

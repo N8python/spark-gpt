@@ -16,10 +16,13 @@ training, and checkpoint export. No framework, no config system, no second file.
   width 256 and verified optimal at 512 and 1024.
 - **Muon/AdamW hybrid optimizer**: Muon (Newton–Schulz orthogonalized momentum)
   on the 2-D body matrices, AdamW on embeddings/head/gains.
-- **Varlen sequence packing**: every batch is exactly `--tokens-per-batch` loss
-  tokens — one static shape, zero padding, one `torch.compile` graph. Attention
-  is block-diagonal via flash-attn varlen: **no cross-document attention**,
-  RoPE restarts per document.
+- **Whole-document varlen packing**: documents are never cut across training
+  batches. Every batch still has exactly `--tokens-per-batch` positions — one
+  static shape and one `torch.compile` graph — with unused tail positions filled
+  by PAD tokens whose targets are ignored. Attention is block-diagonal via
+  flash-attn varlen: **no cross-document attention**, and RoPE restarts per
+  document. The config and metrics report real-token utilization separately
+  from fixed-shape compute throughput.
 - **DDP** via `torchrun`, with crash-safe **resume** (optimizer + scheduler +
   data-stream state; every rank checkpoints to its own local disk, so no shared
   filesystem is needed).
@@ -50,11 +53,16 @@ safetensors 0.8, transformers 5.11 on NVIDIA GB10 (DGX Spark). Sanity check:
 
 ```bash
 python -c "import torch, flash_attn; print(torch.cuda.get_device_name(0), flash_attn.__version__)"
+python -m unittest discover -s tests -v
 ```
 
 ## Data
 
 One JSONL file, one document per line: `{"text": "..."}`.
+
+Each document must fit within both `--tokens-per-batch` and
+`--max-position-embeddings` after byte tokenization. The trainer raises a clear
+error for an oversized document instead of silently splitting its context.
 
 Ready-made example data (the FineWeb slices the defaults point at, including
 `fineweb_1b.jsonl`) is available at
@@ -132,7 +140,9 @@ matmuls are a net loss below ~2048 hidden dim (dynamic-scaling casts are
 bandwidth-bound), and always set
 `PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True`. At the 0.6B shape the
 trainer sustains ~14.0k tok/s on a single GB10 at the default 49,152-token
-window (torch 2.12.0+cu130, flash-attn 2.8.3.post1).
+window (torch 2.12.0+cu130, flash-attn 2.8.3.post1). That is fixed-shape
+compute-token throughput; real loss-token throughput is reported separately
+and equals compute throughput times observed packing utilization.
 
 ## License
 
