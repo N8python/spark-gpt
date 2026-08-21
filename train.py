@@ -1517,6 +1517,7 @@ def main() -> None:
     last_log_compute_tokens = global_compute_tokens
     last_val_loss = None
     last_router_stats = None
+    cumulative_validation_seconds = 0.0
     metrics_file = (run_dir / "metrics.jsonl").open(
         "a" if start_step else "w", encoding="utf-8") if is_main else None
 
@@ -1545,6 +1546,8 @@ def main() -> None:
                     "global_total_tokens": global_total_tokens,
                     "global_compute_tokens": global_compute_tokens,
                     "elapsed_seconds": now - started_at,
+                    "training_elapsed_seconds":
+                        now - started_at - cumulative_validation_seconds,
                     "window_tokens_per_second":
                         (global_compute_tokens - last_log_compute_tokens)
                         / max(1e-9, now - last_log_time),
@@ -1615,11 +1618,20 @@ def main() -> None:
             last_log_compute_tokens = global_compute_tokens
 
         if val_gpu and (step % val_interval == 0 or step == steps_total):
+            validation_started_at = time.perf_counter()
             v_loss = run_val()
+            validation_finished_at = time.perf_counter()
+            validation_seconds = validation_finished_at - validation_started_at
+            cumulative_validation_seconds += validation_seconds
             last_val_loss = v_loss
+            elapsed_at_validation = validation_finished_at - started_at
             vrec = {"event": "validation", "step": step, "total_steps": steps_total,
                     "val_loss": v_loss,
-                    "elapsed_seconds": time.perf_counter() - started_at}
+                    "elapsed_seconds": elapsed_at_validation,
+                    "training_elapsed_seconds":
+                        elapsed_at_validation - cumulative_validation_seconds,
+                    "validation_seconds": validation_seconds,
+                    "cumulative_validation_seconds": cumulative_validation_seconds}
             print(json.dumps(vrec), flush=True)
             metrics_file.write(json.dumps(vrec) + "\n")
             metrics_file.flush()
@@ -1637,6 +1649,8 @@ def main() -> None:
     finished = {
         "event": "finished",
         "elapsed_seconds": elapsed,
+        "training_elapsed_seconds": elapsed - cumulative_validation_seconds,
+        "validation_elapsed_seconds": cumulative_validation_seconds,
         "total_tokens": local_total_tokens,
         "global_total_tokens": global_total_tokens,
         "global_compute_tokens": global_compute_tokens,
