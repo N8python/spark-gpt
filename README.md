@@ -130,11 +130,12 @@ checkpoints renormalize selected probabilities.
 The Qwen3 auxiliary statistic is computed over all sparse layers and real
 (non-filler) tokens. Hard counts are synchronized across DDP ranks, and the
 differentiable local proxy is scaled so DDP averaging yields the global-batch
-gradient. Metrics include CE and optimization losses, auxiliary loss,
-assignment min/max/CV, router entropy, and unused experts. Dense muP transfer
-has not been established across expert count, top-k, router initialization, or
-auxiliary-loss coefficient; tune those before treating a large MoE run as
-canonical.
+gradient. W&B logs language-model CE as `train/loss` for both dense and MoE
+runs, and the raw expert-balancing term as `train/aux_loss` for MoE runs;
+metrics also include assignment min/max/CV, router entropy, and unused experts.
+Dense muP transfer has not been established across expert count, top-k, router
+initialization, or auxiliary-loss coefficient; tune those before treating a
+large MoE run as canonical.
 
 **Hyperparameter tuning:** sweep at `--model-dim 256` (minutes per run), keep
 `head_dim` 128 / `kv-heads = heads/2` / `intermediate = 3*dim`, and the optimum

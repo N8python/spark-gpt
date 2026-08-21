@@ -127,6 +127,44 @@ class AuxiliaryLossTest(unittest.TestCase):
         torch.testing.assert_close(logits.grad, torch.zeros_like(logits))
 
 
+class WandbMetricTest(unittest.TestCase):
+    @staticmethod
+    def record(**overrides):
+        values = {
+            "step": 7,
+            "loss": 1.25,
+            "global_total_tokens": 1234,
+            "real_tokens_per_second": 10.0,
+            "window_tokens_per_second": 11.0,
+            "observed_packing_utilization": 0.9,
+            "lr": 1e-3,
+            "peak_cuda_memory_gb": 2.0,
+        }
+        values.update(overrides)
+        return values
+
+    def test_dense_train_loss_is_lm_loss(self):
+        metrics = train.wandb_train_metrics(self.record())
+        self.assertEqual(metrics["train/loss"], 1.25)
+        self.assertNotIn("train/aux_loss", metrics)
+        self.assertNotIn("router/aux_loss", metrics)
+
+    def test_moe_train_loss_and_balancing_loss_share_one_row(self):
+        metrics = train.wandb_train_metrics(self.record(
+            router_aux_loss=2.75,
+            router_assignment_min_frac=0.1,
+            router_assignment_max_frac=0.2,
+            router_assignment_cv=0.3,
+            router_entropy=1.5,
+            router_unused_experts=0,
+        ))
+        self.assertEqual(metrics["train/loss"], 1.25)
+        self.assertEqual(metrics["train/aux_loss"], 2.75)
+        self.assertEqual(metrics["router/aux_loss"], 2.75)
+        self.assertEqual(metrics["train/step"], 7)
+        self.assertEqual(metrics["train/tokens"], 1234)
+
+
 class InitializationOptimizerExportTest(unittest.TestCase):
     def test_experts_use_muon_and_router_uses_no_decay_adamw(self):
         model = train.ByteLM(tiny_config())

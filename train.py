@@ -1039,6 +1039,37 @@ def finish_wandb_with_timeout(wandb_run, timeout_seconds: float) -> bool:
     return True
 
 
+def wandb_train_metrics(record: dict) -> dict:
+    """Build one comparable W&B history row for a training step.
+
+    ``train/loss`` is always the unregularized language-model cross entropy.
+    For MoE runs, ``train/aux_loss`` exposes the raw expert-balancing loss; the
+    same value is also available under the router-namespaced
+    ``router/aux_loss`` key.
+    """
+    metrics = {
+        "train/loss": record["loss"],
+        "train/tokens_per_sec": record["real_tokens_per_second"],
+        "train/compute_tokens_per_sec": record["window_tokens_per_second"],
+        "train/packing_utilization": record["observed_packing_utilization"],
+        "train/lr": record["lr"],
+        "train/peak_cuda_memory_gb": record["peak_cuda_memory_gb"],
+        "train/step": record["step"],
+        "train/tokens": record["global_total_tokens"],
+    }
+    if "router_aux_loss" in record:
+        metrics.update({
+            "train/aux_loss": record["router_aux_loss"],
+            "router/aux_loss": record["router_aux_loss"],
+            "router/assignment_min_frac": record["router_assignment_min_frac"],
+            "router/assignment_max_frac": record["router_assignment_max_frac"],
+            "router/assignment_cv": record["router_assignment_cv"],
+            "router/entropy": record["router_entropy"],
+            "router/unused_experts": record["router_unused_experts"],
+        })
+    return metrics
+
+
 def parse_args() -> argparse.Namespace:
     p = argparse.ArgumentParser(description="sparkgpt: DDP muP byte-level packed pretrainer.")
     p.add_argument("--train-path", default="lang_data/fineweb_1b.jsonl")
@@ -1566,11 +1597,6 @@ def main() -> None:
                 if router_stats is not None:
                     record.update({
                         "router_aux_loss": float(router_stats["aux_loss"].item()),
-                        "optimization_loss": float(
-                            loss.float().item()
-                            + config.router_aux_loss_coef
-                            * router_stats["aux_loss"].item()
-                        ),
                         "router_assignment_min_frac": float(
                             router_stats["assignment_min_frac"].item()
                         ),
@@ -1589,30 +1615,9 @@ def main() -> None:
                 metrics_file.write(json.dumps(record) + "\n")
                 metrics_file.flush()
                 if wandb_run is not None:
-                    wandb_run.log({
-                        "train/loss": record["loss"],
-                        "train/tokens_per_sec": record["real_tokens_per_second"],
-                        "train/compute_tokens_per_sec": record["window_tokens_per_second"],
-                        "train/packing_utilization": record["observed_packing_utilization"],
-                        "train/lr": record["lr"],
-                        "train/peak_cuda_memory_gb": record["peak_cuda_memory_gb"],
-                        "train/step": step,
-                        "train/tokens": global_total_tokens,
-                    })
-                    if router_stats is not None:
-                        wandb_run.log({
-                            "router/aux_loss": record["router_aux_loss"],
-                            "router/assignment_min_frac":
-                                record["router_assignment_min_frac"],
-                            "router/assignment_max_frac":
-                                record["router_assignment_max_frac"],
-                            "router/assignment_cv": record["router_assignment_cv"],
-                            "router/entropy": record["router_entropy"],
-                            "router/unused_experts": record["router_unused_experts"],
-                            "train/optimization_loss": record["optimization_loss"],
-                            "train/step": step,
-                            "train/tokens": global_total_tokens,
-                        })
+                    # A single call keeps LM and router metrics on the same W&B
+                    # history row and therefore on the same token x-axis.
+                    wandb_run.log(wandb_train_metrics(record))
             last_log_time = now
             last_log_global_tokens = global_total_tokens
             last_log_compute_tokens = global_compute_tokens
