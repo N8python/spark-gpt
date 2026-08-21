@@ -11,11 +11,16 @@ training, and checkpoint export. No framework, no config system, no second file.
   tokenizer training, no OOV, fully multilingual by construction.
 - **Qwen3-shaped model**: GQA, qk-norm, SwiGLU, rotate-half RoPE — numerically
   identical to HF `Qwen3ForCausalLM`, so checkpoints export as stock HF models.
+- **Optional Qwen3-MoE layers**: bias-free fp32-softmax top-k routing, packed
+  SwiGLU experts, BF16 grouped GEMM, selected-probability renormalization, and
+  a globally aggregated load-balancing loss. MoE checkpoints export as stock
+  `Qwen3MoeForCausalLM`; dense mode remains the default.
 - **muP width scaling** (always on): tune hyperparameters on a tiny model,
   transfer them to any width unchanged. The default `muon-lr 4e-3` was tuned at
   width 256 and verified optimal at 512 and 1024.
 - **Muon/AdamW hybrid optimizer**: Muon (Newton–Schulz orthogonalized momentum)
-  on the 2-D body matrices, AdamW on embeddings/head/gains.
+  on 2-D body and per-expert 3-D matrices, AdamW on embeddings/head/gains and
+  routers (with no router weight decay).
 - **Whole-document varlen packing**: documents are never cut across training
   batches. Every batch still has exactly `--tokens-per-batch` positions — one
   static shape and one `torch.compile` graph — with unused tail positions filled
@@ -108,6 +113,29 @@ single-node). The Qwen3-0.6B shape (440M non-embedding params) is
 `--model-layers 28 --model-dim 1024 --attention-heads 16 --kv-heads 8
 --intermediate-size 3072` — same hyperparameters, muP transfers them.
 
+Enable compute-matched top-2 MoE feed-forward layers on the default 50M shape:
+
+```bash
+python train.py --run-name moe_8x2 --save-final \
+    --num-experts 8 --num-experts-per-tok 2 --moe-intermediate-size 768
+```
+
+The dense FFN activates width 1536; top-2 experts of width 768 activate the
+same aggregate FFN width per token. This model has about 164M total parameters
+and 50.7M active parameters. `--decoder-sparse-step N` makes every Nth layer
+sparse, while `--mlp-only-layers 0,5` keeps listed zero-based layers dense.
+`--no-norm-topk-prob` is available for experiments, but released Qwen3-MoE
+checkpoints renormalize selected probabilities.
+
+The Qwen3 auxiliary statistic is computed over all sparse layers and real
+(non-filler) tokens. Hard counts are synchronized across DDP ranks, and the
+differentiable local proxy is scaled so DDP averaging yields the global-batch
+gradient. Metrics include CE and optimization losses, auxiliary loss,
+assignment min/max/CV, router entropy, and unused experts. Dense muP transfer
+has not been established across expert count, top-k, router initialization, or
+auxiliary-loss coefficient; tune those before treating a large MoE run as
+canonical.
+
 **Hyperparameter tuning:** sweep at `--model-dim 256` (minutes per run), keep
 `head_dim` 128 / `kv-heads = heads/2` / `intermediate = 3*dim`, and the optimum
 transfers to any width in the family.
@@ -123,7 +151,8 @@ transfers to any width in the family.
   and at the end — `val/loss` in wandb, `final_val_loss` in `summary.json`.
 - `--save-final` writes `model_final.pt` (native fused layout) and
   `checkpoints/<run>/hf/` — the ready-to-load HF directory (periodic saves get
-  `hf_step<N>/` twins on rank 0):
+  `hf_step<N>/` twins on rank 0). Dense exports load as `Qwen3ForCausalLM` and
+  MoE exports load as `Qwen3MoeForCausalLM`:
 
 ```python
 from transformers import AutoModelForCausalLM, AutoTokenizer
@@ -143,6 +172,19 @@ trainer sustains ~14.0k tok/s on a single GB10 at the default 49,152-token
 window (torch 2.12.0+cu130, flash-attn 2.8.3.post1). That is fixed-shape
 compute-token throughput; real loss-token throughput is reported separately
 and equals compute throughput times observed packing utilization.
+
+Controlled 2026-08-21 single-GB10 comparison on the same checksum-pinned
+FineWeb stream (`seed=0`, 5,001,341 real tokens, 104 post-prewarm steps,
+49,152 tokens/step, compile `default`):
+
+| Model | Total params | Active params | Real tok/s | Window tok/s | Peak allocation |
+| --- | ---: | ---: | ---: | ---: | ---: |
+| Dense 16L/512d/MLP1536 | 50,617,856 | 50,617,856 | 81,606 | 83,408 | 14.08 GiB |
+| MoE 8 experts/top-2/I768 | 163,929,600 | 50,683,392 | 56,530 | 57,779 | 18.14 GiB |
+
+The compute-matched MoE delivered 69.27% of dense throughput (30.73% slower)
+and used 4.06 GiB more peak allocation. This isolates training systems cost;
+the short run is not a model-quality comparison.
 
 ## License
 

@@ -1,7 +1,8 @@
 """sparkgpt: single-file DDP muP byte-level LM pretrainer for DGX Spark (GB10).
 
 One file, one recipe. Qwen3-shaped decoder over raw UTF-8 bytes (vocab 259:
-256 bytes + BOS/EOS/PAD), trained with:
+256 bytes + BOS/EOS/PAD), with optional stock-exportable Qwen3-MoE feed-forward
+layers, trained with:
 
   * Whole-document varlen packing -- every batch has the same static
     --tokens-per-batch shape, but document boundaries are NEVER cut. Unused
@@ -16,8 +17,12 @@ One file, one recipe. Qwen3-shaped decoder over raw UTF-8 bytes (vocab 259:
     with the aspect-ratio factor is width-invariant). Verified 2026-07-01:
     optimal muon-lr 4e-3 at widths 256/512/1024. Keep head_dim fixed (128)
     across the width family.
-  * Muon/AdamW hybrid (always). 2-D body matrices -> Muon (NO weight decay);
-    embedding, lm_head, norm gains -> AdamW.
+  * Muon/AdamW hybrid (always). 2-D body and packed 3-D expert matrices ->
+    Muon (NO weight decay); embedding, lm_head, norm gains, and routers ->
+    AdamW (routers have no weight decay).
+  * Optional Qwen3-MoE (--num-experts > 0): fp32 softmax top-k routing,
+    selected-probability renormalization, packed BF16 grouped GEMM, and a
+    filler-masked load-balancing loss aggregated globally across DDP ranks.
   * DDP across Spark nodes via torchrun; packed batches are sharded round-robin by
     rank. Single-process runs need no torchrun.
 
@@ -55,9 +60,9 @@ Hard-won GB10 (sm_121) facts -- do not relearn these:
   * muon-lr 1e-2 (the old 20M-model default) diverges at 440M without muP.
 
 Checkpoints: --save-final writes model_final.pt (native fused layout) plus a
-READY-TO-LOAD HF directory checkpoints/<run>/hf/ (stock Qwen3ForCausalLM
-config + fp32 safetensors + byte tokenizer as a plain tokenizer.json -- no
-custom code, no trust_remote_code; also loads in mlx_lm as qwen3). Periodic
+READY-TO-LOAD HF directory checkpoints/<run>/hf/ (stock Qwen3ForCausalLM or
+Qwen3MoeForCausalLM config + fp32 safetensors + byte tokenizer as a plain
+tokenizer.json -- no custom code, no trust_remote_code). Periodic
 --save-every checkpoints get an hf_step<N>/ twin on rank 0. RoPE is standard
 rotate-half throughout.
 """
@@ -107,6 +112,13 @@ class ModelConfig:
     rms_norm_eps: float = 1e-6
     max_position_embeddings: int = 4096
     rope_theta: float = 1_000_000.0
+    num_experts: int = 0
+    num_experts_per_tok: int = 2
+    moe_intermediate_size: int = 768
+    decoder_sparse_step: int = 1
+    mlp_only_layers: tuple[int, ...] = ()
+    norm_topk_prob: bool = True
+    router_aux_loss_coef: float = 1e-3
 
 
 class RMSNorm(nn.Module):
@@ -182,17 +194,159 @@ class MLP(nn.Module):
         return self.down_proj(F.silu(gate) * up)
 
 
-class Block(nn.Module):
+class TopKRouter(nn.Module):
+    """Qwen3-MoE router: bias-free logits, fp32 softmax, then top-k."""
+
     def __init__(self, config: ModelConfig):
         super().__init__()
+        self.num_experts = config.num_experts
+        self.top_k = config.num_experts_per_tok
+        self.norm_topk_prob = config.norm_topk_prob
+        self.weight = nn.Parameter(torch.empty(config.num_experts, config.hidden_size))
+
+    def forward(self, hidden_states: torch.Tensor):
+        router_logits = F.linear(hidden_states, self.weight)
+        router_probs = F.softmax(router_logits, dtype=torch.float32, dim=-1)
+        routing_weights, selected_experts = torch.topk(
+            router_probs, self.top_k, dim=-1
+        )
+        if self.norm_topk_prob:
+            routing_weights = routing_weights / routing_weights.sum(
+                dim=-1, keepdim=True
+            )
+        return (
+            router_logits,
+            routing_weights.to(dtype=router_logits.dtype),
+            selected_experts,
+        )
+
+
+def _grouped_linear(
+    hidden_states: torch.Tensor,
+    weights: torch.Tensor,
+    offsets: torch.Tensor,
+) -> torch.Tensor:
+    """Jagged grouped linear for expert weights shaped (E, out, in).
+
+    Torch's CUDA grouped GEMM is the production path.  The small eager
+    fallback keeps CPU unit tests and older Torch builds functional.
+    """
+    grouped_mm = getattr(F, "grouped_mm", None)
+    if hidden_states.is_cuda and grouped_mm is not None:
+        # grouped_mm is not autocast-aware. SparkGPT retains fp32 master
+        # parameters, so explicitly form the same bf16 compute view that
+        # autocast supplies to ordinary dense linear layers.
+        compute_weights = weights.to(dtype=hidden_states.dtype)
+        return grouped_mm(
+            hidden_states,
+            compute_weights.transpose(-2, -1),
+            offs=offsets,
+        )
+
+    outputs = []
+    start = 0
+    for expert_idx, end_tensor in enumerate(offsets):
+        end = int(end_tensor.item())
+        if end > start:
+            outputs.append(F.linear(hidden_states[start:end], weights[expert_idx]))
+        start = end
+    if not outputs:
+        return hidden_states.new_empty((0, weights.shape[1]))
+    return torch.cat(outputs, dim=0)
+
+
+class Experts(nn.Module):
+    """Packed Qwen3-MoE experts in the stock HF checkpoint layout."""
+
+    def __init__(self, config: ModelConfig):
+        super().__init__()
+        self.num_experts = config.num_experts
+        self.hidden_dim = config.hidden_size
+        self.intermediate_dim = config.moe_intermediate_size
+        self.gate_up_proj = nn.Parameter(torch.empty(
+            self.num_experts, 2 * self.intermediate_dim, self.hidden_dim
+        ))
+        self.down_proj = nn.Parameter(torch.empty(
+            self.num_experts, self.hidden_dim, self.intermediate_dim
+        ))
+
+    def forward(
+        self,
+        hidden_states: torch.Tensor,
+        selected_experts: torch.Tensor,
+        routing_weights: torch.Tensor,
+    ) -> torch.Tensor:
+        num_tokens = hidden_states.shape[0]
+        top_k = selected_experts.shape[-1]
+
+        flat_experts = selected_experts.reshape(-1)
+        flat_weights = routing_weights.reshape(-1)
+        sorted_experts, permutation = torch.sort(flat_experts)
+        sorted_hidden = hidden_states[permutation // top_k]
+        sorted_weights = flat_weights[permutation]
+
+        histc_input = sorted_experts.int() if hidden_states.is_cuda else sorted_experts.float()
+        tokens_per_expert = torch.histc(
+            histc_input,
+            bins=self.num_experts,
+            min=0,
+            max=self.num_experts - 1,
+        )
+        offsets = torch.cumsum(tokens_per_expert, dim=0, dtype=torch.int32)
+
+        gate, up = _grouped_linear(
+            sorted_hidden, self.gate_up_proj, offsets
+        ).chunk(2, dim=-1)
+        expert_hidden = F.silu(gate) * up
+        expert_output = _grouped_linear(
+            expert_hidden, self.down_proj, offsets
+        )
+        expert_output = expert_output * sorted_weights.unsqueeze(-1)
+
+        inverse_permutation = torch.empty_like(permutation)
+        inverse_permutation[permutation] = torch.arange(
+            permutation.numel(), device=permutation.device
+        )
+        return expert_output[inverse_permutation].view(
+            num_tokens, top_k, self.hidden_dim
+        ).sum(dim=1).to(dtype=hidden_states.dtype)
+
+
+class SparseMoE(nn.Module):
+    def __init__(self, config: ModelConfig):
+        super().__init__()
+        self.gate = TopKRouter(config)
+        self.experts = Experts(config)
+
+    def forward(self, hidden_states: torch.Tensor):
+        router_logits, routing_weights, selected_experts = self.gate(hidden_states)
+        output = self.experts(hidden_states, selected_experts, routing_weights)
+        return output, router_logits, selected_experts
+
+
+class Block(nn.Module):
+    def __init__(self, config: ModelConfig, layer_idx: int):
+        super().__init__()
         self.self_attn = Attention(config)
-        self.mlp = MLP(config.hidden_size, config.intermediate_size)
+        self.is_sparse = config.num_experts > 0 and (
+            layer_idx not in config.mlp_only_layers
+            and (layer_idx + 1) % config.decoder_sparse_step == 0
+        )
+        self.mlp = (
+            SparseMoE(config)
+            if self.is_sparse
+            else MLP(config.hidden_size, config.intermediate_size)
+        )
         self.input_layernorm = RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
         self.post_attention_layernorm = RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
 
     def forward(self, x, cos, sin, cu_seqlens, max_seqlen):
         h = x + self.self_attn(self.input_layernorm(x), cos, sin, cu_seqlens, max_seqlen)
-        return h + self.mlp(self.post_attention_layernorm(h))
+        mlp_input = self.post_attention_layernorm(h)
+        if self.is_sparse:
+            mlp_output, router_logits, selected_experts = self.mlp(mlp_input)
+            return h + mlp_output, router_logits, selected_experts
+        return h + self.mlp(mlp_input), None, None
 
 
 class ByteLM(nn.Module):
@@ -203,7 +357,9 @@ class ByteLM(nn.Module):
         super().__init__()
         self.config = config
         self.embed_tokens = nn.Embedding(config.vocab_size, config.hidden_size)
-        self.layers = nn.ModuleList(Block(config) for _ in range(config.num_hidden_layers))
+        self.layers = nn.ModuleList(
+            Block(config, layer_idx) for layer_idx in range(config.num_hidden_layers)
+        )
         self.norm = RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
         self.lm_head = nn.Linear(config.hidden_size, config.vocab_size, bias=False)
 
@@ -218,7 +374,14 @@ class ByteLM(nn.Module):
         self.register_buffer("cos_cached", emb.cos(), persistent=False)
         self.register_buffer("sin_cached", emb.sin(), persistent=False)
 
-    def forward(self, input_ids, position_ids, cu_seqlens, max_seqlen):
+    def forward(
+        self,
+        input_ids,
+        position_ids,
+        cu_seqlens,
+        max_seqlen,
+        output_router_logits: bool = False,
+    ):
         x = self.embed_tokens(input_ids)
         autocast_enabled = torch.is_autocast_enabled(x.device.type)
         rope_dtype = (
@@ -236,9 +399,19 @@ class ByteLM(nn.Module):
         # rather than recasting both tables for q and k in every layer.
         cos = self.cos_cached[position_ids].to(dtype=rope_dtype)
         sin = self.sin_cached[position_ids].to(dtype=rope_dtype)
+        router_logits = []
+        selected_experts = []
         for layer in self.layers:
-            x = layer(x, cos, sin, cu_seqlens, max_seqlen)
-        return self.lm_head(self.norm(x))
+            x, layer_router_logits, layer_selected_experts = layer(
+                x, cos, sin, cu_seqlens, max_seqlen
+            )
+            if layer_router_logits is not None:
+                router_logits.append(layer_router_logits)
+                selected_experts.append(layer_selected_experts)
+        logits = self.lm_head(self.norm(x))
+        if output_router_logits:
+            return logits, tuple(router_logits), tuple(selected_experts)
+        return logits
 
 
 def export_unfused_state_dict(model: ByteLM) -> dict:
@@ -314,10 +487,7 @@ def _byte_tokenizer_json() -> dict:
 
 
 def export_hf(model: ByteLM, out_dir: Path) -> None:
-    """Write a ready-to-load HF model directory: stock Qwen3ForCausalLM config
-    (the arch matches exactly; standard rotate-half RoPE) + fp32 safetensors +
-    byte tokenizer. Loads with AutoModelForCausalLM / AutoTokenizer, no custom
-    code. Also consumable by mlx_lm as model_type qwen3."""
+    """Write a ready-to-load stock Qwen3 or Qwen3-MoE HF directory."""
     from safetensors.torch import save_file
 
     cfg = model.config
@@ -328,9 +498,10 @@ def export_hf(model: ByteLM, out_dir: Path) -> None:
     }
     save_file(weights, str(out_dir / "model.safetensors"),
               metadata={"format": "pt"})
-    (out_dir / "config.json").write_text(json.dumps({
-        "architectures": ["Qwen3ForCausalLM"],
-        "model_type": "qwen3",
+    is_moe = cfg.num_experts > 0
+    hf_config = {
+        "architectures": ["Qwen3MoeForCausalLM" if is_moe else "Qwen3ForCausalLM"],
+        "model_type": "qwen3_moe" if is_moe else "qwen3",
         "vocab_size": cfg.vocab_size,
         "hidden_size": cfg.hidden_size,
         "num_hidden_layers": cfg.num_hidden_layers,
@@ -351,7 +522,23 @@ def export_hf(model: ByteLM, out_dir: Path) -> None:
         "eos_token_id": EOS,
         "pad_token_id": PAD,
         "torch_dtype": "float32",
-    }, indent=2), encoding="utf-8")
+    }
+    if is_moe:
+        hf_config.update({
+            "decoder_sparse_step": cfg.decoder_sparse_step,
+            "moe_intermediate_size": cfg.moe_intermediate_size,
+            "num_experts": cfg.num_experts,
+            "num_experts_per_tok": cfg.num_experts_per_tok,
+            "norm_topk_prob": cfg.norm_topk_prob,
+            "output_router_logits": False,
+            "router_aux_loss_coef": cfg.router_aux_loss_coef,
+            "mlp_only_layers": list(cfg.mlp_only_layers),
+            "use_sliding_window": False,
+            "sliding_window": None,
+        })
+    (out_dir / "config.json").write_text(
+        json.dumps(hf_config, indent=2), encoding="utf-8"
+    )
     (out_dir / "generation_config.json").write_text(json.dumps({
         "bos_token_id": BOS, "eos_token_id": EOS, "pad_token_id": PAD,
     }, indent=2), encoding="utf-8")
@@ -368,7 +555,14 @@ def export_hf(model: ByteLM, out_dir: Path) -> None:
 # --------------------------------------------------------------------------- #
 # muP: init + per-group lrs
 # --------------------------------------------------------------------------- #
-def apply_mup_init(model: ByteLM, *, base_dim: int, emb_std: float, hidden_std: float) -> dict:
+def apply_mup_init(
+    model: ByteLM,
+    *,
+    base_dim: int,
+    emb_std: float,
+    hidden_std: float,
+    router_std: float = 0.02,
+) -> dict:
     cfg = model.config
     m = cfg.hidden_size / base_dim
     std_in = hidden_std / math.sqrt(m)
@@ -378,12 +572,17 @@ def apply_mup_init(model: ByteLM, *, base_dim: int, emb_std: float, hidden_std: 
         model.lm_head.weight.zero_()
         for block in model.layers:
             block.self_attn.qkv_proj.weight.normal_(0.0, std_in)
-            block.mlp.gate_up_proj.weight.normal_(0.0, std_in)
             block.self_attn.o_proj.weight.normal_(0.0, std_writer)
-            block.mlp.down_proj.weight.normal_(0.0, std_writer)
+            if block.is_sparse:
+                block.mlp.experts.gate_up_proj.normal_(0.0, std_in)
+                block.mlp.experts.down_proj.normal_(0.0, std_writer)
+                block.mlp.gate.weight.normal_(0.0, router_std)
+            else:
+                block.mlp.gate_up_proj.weight.normal_(0.0, std_in)
+                block.mlp.down_proj.weight.normal_(0.0, std_writer)
     return {"width_mult": m, "hidden_init_std": std_in,
             "residual_writer_init_std": std_writer, "emb_init_std": emb_std,
-            "lm_head_init": "zero"}
+            "lm_head_init": "zero", "router_init_std": router_std}
 
 
 # --------------------------------------------------------------------------- #
@@ -451,23 +650,32 @@ class MuonAdamWHybrid(torch.optim.Optimizer):
         else:
             updates = [v.clone() for v in vs]
 
-        by_shape: dict[tuple[int, int], list] = {}
+        by_shape: dict[tuple[int, int, int], list] = {}
         for p, u in zip(params, updates):
-            by_shape.setdefault(tuple(u.shape), []).append((p, u))
-        for (rows, cols), items in by_shape.items():
-            # Stack directly into the bf16 NS input.  The previous fp32 stack
-            # followed by a cast made an avoidable model-sized intermediate.
+            if u.ndim not in (2, 3):
+                raise ValueError(f"Muon requires 2-D or 3-D parameters, got {u.shape}")
+            by_shape.setdefault((u.ndim, u.shape[-2], u.shape[-1]), []).append((p, u))
+        for (ndim, rows, cols), items in by_shape.items():
+            batch_sizes = [1 if ndim == 2 else u.shape[0] for _, u in items]
             stacked = torch.empty(
-                (len(items), rows, cols), device=items[0][1].device,
+                (sum(batch_sizes), rows, cols), device=items[0][1].device,
                 dtype=torch.bfloat16,
             )
-            torch.stack([u for _, u in items], out=stacked)
+            offset = 0
+            for (_, update), batch_size in zip(items, batch_sizes):
+                source = update.unsqueeze(0) if ndim == 2 else update
+                stacked[offset : offset + batch_size].copy_(source)
+                offset += batch_size
             ortho = _newtonschulz5_batched(stacked, steps=group["ns_steps"])
             # aspect-ratio factor; also what makes Muon lr width-invariant
             lr = group["lr"] * max(1, rows / cols) ** 0.5
+            if ndim == 2:
+                ortho_updates = list(ortho.unbind(0))
+            else:
+                ortho_updates = list(ortho.split(batch_sizes, dim=0))
             torch._foreach_add_(
                 [p for p, _ in items],
-                list(ortho.unbind(0)),
+                ortho_updates,
                 alpha=-lr,
             )
 
@@ -505,16 +713,22 @@ def build_optimizer(model: torch.nn.Module, args: argparse.Namespace):
     """muP groups: Muon on 2-D body at base lr (width-invariant); AdamW on
     embedding + gains at base lr and on lm_head at lr * base/width."""
     head_mult = args.mup_base_dim / args.model_dim
-    muon_params, adamw_const, adamw_head = [], [], []
+    muon_params, adamw_const, adamw_head, adamw_router = [], [], [], []
     for name, param in model.named_parameters():
         if not param.requires_grad:
             continue
         if "lm_head" in name:
             adamw_head.append(param)
+        elif name.endswith("mlp.gate.weight"):
+            adamw_router.append(param)
         elif param.ndim != 2 or "embed" in name:
-            adamw_const.append(param)
+            if param.ndim == 3 and ".experts." in name:
+                muon_params.append(param)
+            else:
+                adamw_const.append(param)
         else:
             muon_params.append(param)
+    router_lr = args.router_lr if args.router_lr is not None else args.adamw_lr
     optimizer = MuonAdamWHybrid([
         {"params": muon_params, "use_muon": True, "lr": args.muon_lr,
          "momentum": args.muon_momentum, "weight_decay": 0.0},
@@ -522,13 +736,120 @@ def build_optimizer(model: torch.nn.Module, args: argparse.Namespace):
          "weight_decay": args.weight_decay},
         {"params": adamw_head, "use_muon": False, "lr": args.adamw_lr * head_mult,
          "weight_decay": args.weight_decay},
+        {"params": adamw_router, "use_muon": False, "lr": router_lr,
+         "weight_decay": 0.0},
     ])
     return optimizer, {
         "mode": "mup_muon_hybrid",
         "head_lr_mult": head_mult,
+        "router_lr": router_lr,
+        "router_param_count": sum(p.numel() for p in adamw_router),
         "muon_param_count": sum(p.numel() for p in muon_params),
-        "adamw_param_count": sum(p.numel() for p in adamw_const + adamw_head),
+        "adamw_param_count": sum(
+            p.numel() for p in adamw_const + adamw_head + adamw_router
+        ),
     }
+
+
+def global_load_balancing_loss(
+    router_logits: tuple[torch.Tensor, ...],
+    selected_experts: tuple[torch.Tensor, ...],
+    valid_mask: torch.Tensor,
+    *,
+    num_experts: int,
+    top_k: int,
+) -> tuple[torch.Tensor, dict[str, torch.Tensor]]:
+    """Qwen3 auxiliary router loss over all sparse layers and DDP ranks.
+
+    The hard top-k counts are global constants.  The local differentiable
+    proxy is scaled so DDP's gradient averaging produces the gradient of the
+    true global-batch loss.  The straight-through value correction makes every
+    rank report the same global scalar, including when one rank is all filler.
+    """
+    if not router_logits:
+        zero = valid_mask.sum(dtype=torch.float32) * 0.0
+        return zero, {
+            "aux_loss": zero.detach(),
+            "assignment_min_frac": zero.detach(),
+            "assignment_max_frac": zero.detach(),
+            "assignment_cv": zero.detach(),
+            "router_entropy": zero.detach(),
+            "unused_experts": zero.detach(),
+        }
+    if len(router_logits) != len(selected_experts):
+        raise ValueError("router logits and selected-expert layers do not match")
+
+    mask = valid_mask.to(dtype=torch.float32)
+    soft_sums = torch.zeros(num_experts, device=valid_mask.device, dtype=torch.float32)
+    hard_counts = torch.zeros_like(soft_sums)
+    entropy_sum = torch.zeros((), device=valid_mask.device, dtype=torch.float32)
+    valid_rows = torch.zeros((), device=valid_mask.device, dtype=torch.float32)
+
+    for logits, indices in zip(router_logits, selected_experts):
+        if logits.shape[:-1] != valid_mask.shape or logits.shape[-1] != num_experts:
+            raise ValueError("router-logit shape does not match the token mask/config")
+        if indices.shape != (*valid_mask.shape, top_k):
+            raise ValueError("selected-expert shape does not match the token mask/config")
+        probs = F.softmax(logits, dtype=torch.float32, dim=-1)
+        soft_sums = soft_sums + (probs * mask.unsqueeze(-1)).sum(dim=0)
+        count_weights = mask.unsqueeze(-1).expand(-1, top_k).reshape(-1)
+        hard_counts = hard_counts + torch.bincount(
+            indices.reshape(-1), weights=count_weights, minlength=num_experts
+        )
+        with torch.no_grad():
+            detached_probs = probs.detach()
+            entropy_sum = entropy_sum - (
+                detached_probs
+                * detached_probs.clamp_min(torch.finfo(detached_probs.dtype).tiny).log()
+                * mask.unsqueeze(-1)
+            ).sum()
+        valid_rows = valid_rows + mask.sum()
+
+    distributed = dist.is_available() and dist.is_initialized()
+    world_size = dist.get_world_size() if distributed else 1
+    global_counts = hard_counts.detach().clone()
+    global_soft_sums = soft_sums.detach().clone()
+    global_entropy_sum = entropy_sum.detach().clone()
+    global_valid_rows = valid_rows.detach().clone()
+    if distributed:
+        for tensor in (
+            global_counts,
+            global_soft_sums,
+            global_entropy_sum,
+            global_valid_rows,
+        ):
+            dist.all_reduce(tensor, op=dist.ReduceOp.SUM)
+
+    safe_global_rows = global_valid_rows.clamp_min(1.0)
+    has_valid_rows = (global_valid_rows > 0).to(dtype=torch.float32)
+    assignments_per_row = global_counts / safe_global_rows
+    global_mean_probs = global_soft_sums / safe_global_rows
+    global_aux = (
+        has_valid_rows
+        * num_experts
+        * torch.dot(assignments_per_row, global_mean_probs)
+    )
+    local_proxy = (
+        has_valid_rows
+        * world_size
+        * num_experts
+        / safe_global_rows
+        * torch.dot(assignments_per_row, soft_sums)
+    )
+    aux_loss = local_proxy + (global_aux - local_proxy.detach())
+
+    assignment_frac = global_counts / (safe_global_rows * top_k)
+    assignment_mean = assignment_frac.mean()
+    stats = {
+        "aux_loss": global_aux,
+        "assignment_min_frac": assignment_frac.min(),
+        "assignment_max_frac": assignment_frac.max(),
+        "assignment_cv": assignment_frac.std(unbiased=False)
+        / assignment_mean.clamp_min(1e-12),
+        "router_entropy": global_entropy_sum / safe_global_rows,
+        "unused_experts": (global_counts == 0).sum(dtype=torch.float32),
+    }
+    return aux_loss, stats
 
 
 # --------------------------------------------------------------------------- #
@@ -734,6 +1055,21 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--intermediate-size", type=int, default=1536)
     p.add_argument("--rope-theta", type=float, default=1_000_000.0)
     p.add_argument("--max-position-embeddings", type=int, default=4096)
+    # optional Qwen3-MoE feed-forward layers (--num-experts 0 keeps dense mode)
+    p.add_argument("--num-experts", type=int, default=0)
+    p.add_argument("--num-experts-per-tok", type=int, default=2)
+    p.add_argument("--moe-intermediate-size", type=int, default=768)
+    p.add_argument("--decoder-sparse-step", type=int, default=1)
+    p.add_argument(
+        "--mlp-only-layers", default="",
+        help="comma-separated zero-based layer indices that remain dense",
+    )
+    p.add_argument(
+        "--norm-topk-prob", action=argparse.BooleanOptionalAction, default=True,
+        help="renormalize the selected expert probabilities (Qwen3 checkpoints: true)",
+    )
+    p.add_argument("--router-aux-loss-coef", type=float, default=1e-3)
+    p.add_argument("--router-init-std", type=float, default=0.02)
     # muP (base hparams defined at --mup-base-dim; verified transfer to 1024)
     p.add_argument("--mup-base-dim", type=int, default=256)
     p.add_argument("--mup-emb-std", type=float, default=0.02)
@@ -742,6 +1078,10 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--muon-lr", type=float, default=4e-3)
     p.add_argument("--muon-momentum", type=float, default=0.95)
     p.add_argument("--adamw-lr", type=float, default=5e-4)
+    p.add_argument(
+        "--router-lr", type=float, default=None,
+        help="router AdamW learning rate (default: --adamw-lr; no weight decay)",
+    )
     p.add_argument("--weight-decay", type=float, default=0.01, help="AdamW groups only")
     p.add_argument("--warmup-frac", type=float, default=0.02)
     p.add_argument("--lr-decay-factor", type=float, default=0.1)
@@ -788,6 +1128,38 @@ def main() -> None:
         raise ValueError("--ddp-timeout-seconds must be positive")
     if args.wandb_finish_timeout_seconds <= 0:
         raise ValueError("--wandb-finish-timeout-seconds must be positive")
+    try:
+        mlp_only_layers = tuple(
+            int(item) for item in args.mlp_only_layers.split(",") if item.strip()
+        )
+    except ValueError as exc:
+        raise ValueError("--mlp-only-layers must be comma-separated integers") from exc
+    if len(set(mlp_only_layers)) != len(mlp_only_layers):
+        raise ValueError("--mlp-only-layers contains duplicate indices")
+    if any(layer < 0 or layer >= args.model_layers for layer in mlp_only_layers):
+        raise ValueError("--mlp-only-layers indices must refer to existing layers")
+    if args.num_experts < 0:
+        raise ValueError("--num-experts must be nonnegative")
+    if args.num_experts > 0:
+        if not 1 <= args.num_experts_per_tok <= args.num_experts:
+            raise ValueError("--num-experts-per-tok must be between 1 and --num-experts")
+        if args.moe_intermediate_size <= 0:
+            raise ValueError("--moe-intermediate-size must be positive")
+        if args.decoder_sparse_step <= 0:
+            raise ValueError("--decoder-sparse-step must be positive")
+        if args.router_aux_loss_coef < 0:
+            raise ValueError("--router-aux-loss-coef must be nonnegative")
+        if args.router_init_std <= 0:
+            raise ValueError("--router-init-std must be positive")
+        sparse_layers = [
+            layer for layer in range(args.model_layers)
+            if layer not in mlp_only_layers
+            and (layer + 1) % args.decoder_sparse_step == 0
+        ]
+        if not sparse_layers:
+            raise ValueError("MoE is enabled but the layer selection produces no sparse layers")
+    elif mlp_only_layers:
+        raise ValueError("--mlp-only-layers requires --num-experts > 0")
     data_seed = args.data_seed if args.data_seed is not None else args.seed
 
     rank = int(os.environ.get("RANK", "0"))
@@ -874,10 +1246,18 @@ def main() -> None:
         head_dim=args.head_dim,
         max_position_embeddings=args.max_position_embeddings,
         rope_theta=args.rope_theta,
+        num_experts=args.num_experts,
+        num_experts_per_tok=args.num_experts_per_tok,
+        moe_intermediate_size=args.moe_intermediate_size,
+        decoder_sparse_step=args.decoder_sparse_step,
+        mlp_only_layers=mlp_only_layers,
+        norm_topk_prob=args.norm_topk_prob,
+        router_aux_loss_coef=args.router_aux_loss_coef,
     )
     model = ByteLM(config).to(device)
     mup_summary = apply_mup_init(model, base_dim=args.mup_base_dim,
-                                 emb_std=args.mup_emb_std, hidden_std=args.mup_hidden_std)
+                                 emb_std=args.mup_emb_std, hidden_std=args.mup_hidden_std,
+                                 router_std=args.router_init_std)
     raw_model = model  # for checkpointing
     if distributed:
         # RoPE caches are immutable and deterministically identical on every
@@ -900,10 +1280,20 @@ def main() -> None:
     run_dir = Path("checkpoints") / args.run_name
     run_dir.mkdir(parents=True, exist_ok=True)
     param_count = sum(p.numel() for p in raw_model.parameters())
+    expert_param_count = sum(
+        p.numel() for name, p in raw_model.named_parameters() if ".experts." in name
+    )
+    active_expert_param_count = (
+        expert_param_count * args.num_experts_per_tok // args.num_experts
+        if args.num_experts > 0 else 0
+    )
+    active_param_count = param_count - expert_param_count + active_expert_param_count
     config_payload = {
         "args": vars(args),
         "model_config": asdict(config),
         "parameter_count": param_count,
+        "active_parameter_count": active_param_count,
+        "expert_parameter_count": expert_param_count,
         "mup": mup_summary,
         "optimizer": optimizer_summary,
         "torch_version": torch.__version__,
@@ -956,7 +1346,17 @@ def main() -> None:
     def forward_backward(w: int):
         ids, tgt, pos_t, cu_t, real_tokens = batch_for(w)
         with torch.amp.autocast(device_type="cuda", dtype=torch.bfloat16):
-            logits = model(ids, pos_t, cu_t, global_max_seqlen)
+            model_output = model(
+                ids,
+                pos_t,
+                cu_t,
+                global_max_seqlen,
+                output_router_logits=config.num_experts > 0,
+            )
+            if config.num_experts > 0:
+                logits, router_logits, selected_experts = model_output
+            else:
+                logits = model_output
             loss_sum = F.cross_entropy(
                 logits.float(), tgt, ignore_index=LOSS_IGNORE_INDEX, reduction="sum"
             )
@@ -967,8 +1367,23 @@ def main() -> None:
         if distributed:
             dist.all_reduce(global_tokens_t, op=dist.ReduceOp.SUM)
         scaled_loss = loss_sum * world_size / global_tokens_t.to(loss_sum.dtype)
+        router_stats = None
+        if config.num_experts > 0:
+            router_aux_loss, router_stats = global_load_balancing_loss(
+                router_logits,
+                selected_experts,
+                tgt != LOSS_IGNORE_INDEX,
+                num_experts=config.num_experts,
+                top_k=config.num_experts_per_tok,
+            )
+            scaled_loss = scaled_loss + config.router_aux_loss_coef * router_aux_loss
         scaled_loss.backward()
-        return loss_sum.detach(), real_tokens, int(global_tokens_t.item())
+        return (
+            loss_sum.detach(),
+            real_tokens,
+            int(global_tokens_t.item()),
+            router_stats,
+        )
 
     # Val windows live on the GPU for the whole run (~1.2 MB each).  Validation
     # is rank 0 only and MUST bypass the DDP wrapper: otherwise its forward-time
@@ -1009,6 +1424,7 @@ def main() -> None:
     # model/optimizer states are identical across ranks by DDP construction.
     fingerprint = {
         "train_path": args.train_path,
+        "model_config": asdict(config),
         "selected_tokens": selected_tokens,
         "window": window,
         "packing_format": PACKING_FORMAT,
@@ -1060,16 +1476,25 @@ def main() -> None:
     model.train()
     if remaining:
         prewarm_start = time.perf_counter()
-        warm_loss_sum, _, warm_global_tokens = forward_backward(remaining[0])
+        warm_loss_sum, _, warm_global_tokens, warm_router_stats = forward_backward(
+            remaining[0]
+        )
         if distributed:
             dist.all_reduce(warm_loss_sum, op=dist.ReduceOp.SUM)
         warm_loss = warm_loss_sum / warm_global_tokens
         model.zero_grad(set_to_none=True)
         torch.cuda.synchronize()
         if is_main:
-            print(json.dumps({"event": "prewarm",
-                              "elapsed_seconds": time.perf_counter() - prewarm_start,
-                              "warm_loss": float(warm_loss.float().item())}), flush=True)
+            prewarm_record = {
+                "event": "prewarm",
+                "elapsed_seconds": time.perf_counter() - prewarm_start,
+                "warm_loss": float(warm_loss.float().item()),
+            }
+            if warm_router_stats is not None:
+                prewarm_record["router_aux_loss"] = float(
+                    warm_router_stats["aux_loss"].item()
+                )
+            print(json.dumps(prewarm_record), flush=True)
 
     # ---- train ----
     torch.cuda.reset_peak_memory_stats()
@@ -1091,12 +1516,14 @@ def main() -> None:
     last_log_global_tokens = global_total_tokens
     last_log_compute_tokens = global_compute_tokens
     last_val_loss = None
+    last_router_stats = None
     metrics_file = (run_dir / "metrics.jsonl").open(
         "a" if start_step else "w", encoding="utf-8") if is_main else None
 
     for step, w in enumerate(remaining, start=start_step + 1):
         optimizer.zero_grad(set_to_none=True)
-        loss_sum, local_step_tokens, global_step_tokens = forward_backward(w)
+        loss_sum, local_step_tokens, global_step_tokens, router_stats = forward_backward(w)
+        last_router_stats = router_stats
         optimizer.step()
         scheduler.step()
         local_total_tokens += local_step_tokens
@@ -1133,6 +1560,28 @@ def main() -> None:
                     "lr": optimizer.param_groups[0]["lr"],
                     "peak_cuda_memory_gb": torch.cuda.max_memory_allocated() / 1024**3,
                 }
+                if router_stats is not None:
+                    record.update({
+                        "router_aux_loss": float(router_stats["aux_loss"].item()),
+                        "optimization_loss": float(
+                            loss.float().item()
+                            + config.router_aux_loss_coef
+                            * router_stats["aux_loss"].item()
+                        ),
+                        "router_assignment_min_frac": float(
+                            router_stats["assignment_min_frac"].item()
+                        ),
+                        "router_assignment_max_frac": float(
+                            router_stats["assignment_max_frac"].item()
+                        ),
+                        "router_assignment_cv": float(
+                            router_stats["assignment_cv"].item()
+                        ),
+                        "router_entropy": float(router_stats["router_entropy"].item()),
+                        "router_unused_experts": int(
+                            router_stats["unused_experts"].item()
+                        ),
+                    })
                 print(json.dumps(record), flush=True)
                 metrics_file.write(json.dumps(record) + "\n")
                 metrics_file.flush()
@@ -1147,6 +1596,20 @@ def main() -> None:
                         "train/step": step,
                         "train/tokens": global_total_tokens,
                     })
+                    if router_stats is not None:
+                        wandb_run.log({
+                            "router/aux_loss": record["router_aux_loss"],
+                            "router/assignment_min_frac":
+                                record["router_assignment_min_frac"],
+                            "router/assignment_max_frac":
+                                record["router_assignment_max_frac"],
+                            "router/assignment_cv": record["router_assignment_cv"],
+                            "router/entropy": record["router_entropy"],
+                            "router/unused_experts": record["router_unused_experts"],
+                            "train/optimization_loss": record["optimization_loss"],
+                            "train/step": step,
+                            "train/tokens": global_total_tokens,
+                        })
             last_log_time = now
             last_log_global_tokens = global_total_tokens
             last_log_compute_tokens = global_compute_tokens
@@ -1187,6 +1650,17 @@ def main() -> None:
     }
     if last_val_loss is not None:
         finished["final_val_loss"] = last_val_loss
+    if last_router_stats is not None:
+        finished.update({
+            "final_router_aux_loss": float(last_router_stats["aux_loss"].item()),
+            "final_router_assignment_cv": float(
+                last_router_stats["assignment_cv"].item()
+            ),
+            "final_router_entropy": float(last_router_stats["router_entropy"].item()),
+            "final_router_unused_experts": int(
+                last_router_stats["unused_experts"].item()
+            ),
+        })
 
     # Tear DDP down while every rank is at the same point, before rank 0 enters
     # checkpoint export or W&B finalization.  Previously rank 1 waited in this
