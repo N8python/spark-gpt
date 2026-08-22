@@ -251,6 +251,35 @@ class InitializationOptimizerExportTest(unittest.TestCase):
     "CUDA grouped_mm is required",
 )
 class CudaGroupedMMTest(unittest.TestCase):
+    def test_buffered_newton_schulz_matches_reference(self):
+        def reference(x, steps=5):
+            a, b, c = (3.4445, -4.7750, 2.0315)
+            transpose_needed = x.shape[-2] > x.shape[-1]
+            if transpose_needed:
+                x = x.mT
+            x = x / (x.norm(dim=(-2, -1), keepdim=True) + 1e-7)
+            for _ in range(steps):
+                gram = x @ x.mT
+                polynomial = torch.baddbmm(
+                    gram, gram, gram, beta=b, alpha=c
+                )
+                x = torch.baddbmm(
+                    x, polynomial, x, beta=a, alpha=1.0
+                )
+            return x.mT if transpose_needed else x
+
+        torch.manual_seed(0)
+        for rows, columns in ((1536, 512), (512, 768)):
+            with self.subTest(rows=rows, columns=columns):
+                value = torch.randn(
+                    2, rows, columns, device="cuda", dtype=torch.bfloat16
+                )
+                expected = reference(value.clone())
+                actual = train._newtonschulz5_batched(value.clone())
+                torch.testing.assert_close(
+                    actual, expected, rtol=0.0, atol=0.0
+                )
+
     def test_output_scatter_matches_inverse_gather(self):
         torch.manual_seed(0)
         num_tokens, top_k, hidden_dim = 256, 2, 128

@@ -593,16 +593,28 @@ def apply_mup_init(
 # --------------------------------------------------------------------------- #
 def _newtonschulz5_batched(X: torch.Tensor, steps: int = 5) -> torch.Tensor:
     """Orthogonalize a (B, r, c) stack of same-shape matrices (one bmm chain
-    per iteration -- the step is kernel-launch-bound on GB10 otherwise)."""
+    per iteration -- the step is kernel-launch-bound on GB10 otherwise).
+
+    The staging stack is disposable, so normalize it in place and ping-pong
+    explicit output buffers across iterations. Besides avoiding allocator work,
+    this preserves the transpose-friendly layout of tall expert matrices.
+    """
     a, b, c = (3.4445, -4.7750, 2.0315)
     transpose_needed = X.shape[-2] > X.shape[-1]
     if transpose_needed:
         X = X.mT
-    X = X / (X.norm(dim=(-2, -1), keepdim=True) + 1e-7)
+    X.div_(X.norm(dim=(-2, -1), keepdim=True) + 1e-7)
+    next_X = torch.empty_like(X)
+    A = torch.empty(
+        X.shape[0], X.shape[1], X.shape[1],
+        device=X.device, dtype=X.dtype,
+    )
+    B = torch.empty_like(A)
     for _ in range(steps):
-        A = X @ X.mT
-        B = torch.baddbmm(A, A, A, beta=b, alpha=c)
-        X = torch.baddbmm(X, B, X, beta=a, alpha=1.0)
+        torch.bmm(X, X.mT, out=A)
+        torch.baddbmm(A, A, A, beta=b, alpha=c, out=B)
+        torch.baddbmm(X, B, X, beta=a, alpha=1.0, out=next_X)
+        X, next_X = next_X, X
     if transpose_needed:
         X = X.mT
     return X
