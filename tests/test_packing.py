@@ -9,6 +9,7 @@ from train import (
     build_whole_document_batches,
     materialize_packed_batch,
     packed_batch_metadata,
+    resolve_training_schedule,
 )
 
 
@@ -80,6 +81,48 @@ class WholeDocumentPackingTest(unittest.TestCase):
     def test_oversized_document_is_rejected_instead_of_split(self):
         with self.assertRaisesRegex(ValueError, "whole-document packing will not split"):
             build_whole_document_batches(np.asarray([0, 11]), window=10)
+
+
+class TrainingScheduleTest(unittest.TestCase):
+    def test_defaults_follow_actual_run_length(self):
+        schedule, warmup, val_interval = resolve_training_schedule(
+            2067,
+            lr_schedule_steps=None,
+            warmup_frac=0.02,
+            val_interval_frac=0.05,
+            val_interval_steps=None,
+        )
+        self.assertEqual((schedule, warmup, val_interval), (2067, 42, 104))
+
+    def test_short_run_can_be_exact_prefix_of_1b_schedule(self):
+        schedule, warmup, val_interval = resolve_training_schedule(
+            2067,
+            lr_schedule_steps=20644,
+            warmup_frac=0.02,
+            val_interval_frac=0.05,
+            val_interval_steps=413,
+        )
+        self.assertEqual((schedule, warmup, val_interval), (20644, 413, 413))
+
+    def test_rejects_schedule_shorter_than_actual_run(self):
+        with self.assertRaisesRegex(ValueError, "at least the actual"):
+            resolve_training_schedule(
+                2067,
+                lr_schedule_steps=2000,
+                warmup_frac=0.02,
+                val_interval_frac=0.05,
+                val_interval_steps=None,
+            )
+
+    def test_rejects_nonpositive_explicit_val_interval(self):
+        with self.assertRaisesRegex(ValueError, "must be positive"):
+            resolve_training_schedule(
+                2067,
+                lr_schedule_steps=20644,
+                warmup_frac=0.02,
+                val_interval_frac=0.05,
+                val_interval_steps=0,
+            )
 
 
 if __name__ == "__main__":

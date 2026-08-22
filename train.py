@@ -1018,6 +1018,40 @@ def cosine_with_warmup(step, *, warmup_steps, total_steps, min_lr_ratio):
     return min_lr_ratio + (1.0 - min_lr_ratio) * 0.5 * (1.0 + math.cos(math.pi * progress))
 
 
+def resolve_training_schedule(
+    actual_steps: int,
+    *,
+    lr_schedule_steps: int | None,
+    warmup_frac: float,
+    val_interval_frac: float,
+    val_interval_steps: int | None,
+) -> tuple[int, int, int]:
+    """Resolve LR horizon and validation cadence for this finite data prefix.
+
+    Ordinarily the LR horizon equals the number of actual optimizer steps.  A
+    longer explicit horizon makes a short run an exact prefix of that longer
+    schedule, including its warmup.  This is useful for extrapolation studies
+    without loading or training on the complete data stream.
+    """
+    if actual_steps <= 0:
+        raise ValueError("actual training steps must be positive")
+    schedule_steps = actual_steps if lr_schedule_steps is None else lr_schedule_steps
+    if schedule_steps < actual_steps:
+        raise ValueError("--lr-schedule-steps must be at least the actual training steps")
+    if warmup_frac < 0:
+        raise ValueError("--warmup-frac must be non-negative")
+    warmup_steps = max(10, math.ceil(warmup_frac * schedule_steps))
+    if val_interval_steps is not None:
+        if val_interval_steps <= 0:
+            raise ValueError("--val-interval-steps must be positive")
+        resolved_val_interval = val_interval_steps
+    else:
+        if val_interval_frac <= 0:
+            raise ValueError("--val-interval-frac must be positive")
+        resolved_val_interval = max(1, math.ceil(val_interval_frac * actual_steps))
+    return schedule_steps, warmup_steps, resolved_val_interval
+
+
 # --------------------------------------------------------------------------- #
 # Trainer
 # --------------------------------------------------------------------------- #
@@ -1131,6 +1165,11 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--weight-decay", type=float, default=0.01, help="AdamW groups only")
     p.add_argument("--warmup-frac", type=float, default=0.02)
     p.add_argument("--lr-decay-factor", type=float, default=0.1)
+    p.add_argument(
+        "--lr-schedule-steps", type=int, default=None,
+        help="LR schedule horizon in optimizer steps (default: actual training steps); "
+             "set longer than the run to train an exact prefix of that schedule",
+    )
     # batching / runtime
     p.add_argument("--tokens-per-batch", type=int, default=49152,
                    help="window size per rank per step (GB10 memory optimum)")
@@ -1148,6 +1187,11 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--val-tokens", type=int, default=2_000_000,
                    help="loss-token budget for the val set (packed like training)")
     p.add_argument("--val-interval-frac", type=float, default=0.05)
+    p.add_argument(
+        "--val-interval-steps", type=int, default=None,
+        help="exact validation cadence in optimizer steps; overrides "
+             "--val-interval-frac",
+    )
     p.add_argument("--save-final", action="store_true")
     p.add_argument("--save-every", type=int, default=0,
                    help="write a RESUMABLE checkpoint (model+optimizer+scheduler+step) "
@@ -1255,6 +1299,13 @@ def main() -> None:
     training_real_tokens = sum(batch.real_tokens for batch in train_batches)
     training_compute_tokens = scheduled_batches * window
     packing_utilization = training_real_tokens / training_compute_tokens
+    lr_schedule_steps, warmup_steps, val_interval = resolve_training_schedule(
+        steps_total,
+        lr_schedule_steps=args.lr_schedule_steps,
+        warmup_frac=args.warmup_frac,
+        val_interval_frac=args.val_interval_frac,
+        val_interval_steps=args.val_interval_steps,
+    )
 
     # Held-out validation set (rank 0 only): whole-document packed in file order
     # so the metric is stable across runs.
@@ -1315,11 +1366,10 @@ def main() -> None:
     if args.compile:
         model = torch.compile(model, mode="default", dynamic=False)
     optimizer, optimizer_summary = build_optimizer(model, args)
-    warmup_steps = max(10, math.ceil(args.warmup_frac * steps_total))
     scheduler = torch.optim.lr_scheduler.LambdaLR(
         optimizer,
         lr_lambda=lambda step: cosine_with_warmup(
-            step, warmup_steps=warmup_steps, total_steps=steps_total,
+            step, warmup_steps=warmup_steps, total_steps=lr_schedule_steps,
             min_lr_ratio=args.lr_decay_factor),
     )
 
@@ -1355,7 +1405,9 @@ def main() -> None:
         "padding_compute_tokens": training_compute_tokens - training_real_tokens,
         "packing_utilization": packing_utilization,
         "steps_per_rank": steps_total,
+        "lr_schedule_steps": lr_schedule_steps,
         "warmup_steps": warmup_steps,
+        "val_interval_steps": val_interval,
         "world_size": world_size,
         "rank": rank,
         "data_prep_seconds": data_elapsed,
@@ -1443,7 +1495,6 @@ def main() -> None:
         cu_t = torch.from_numpy(vcu).to(device)
         torch._dynamo.mark_dynamic(cu_t, 0)
         val_gpu.append((ids, tgt, pos_t, cu_t, vreal))
-    val_interval = max(1, math.ceil(args.val_interval_frac * steps_total))
     if val_gpu:
         print(json.dumps({"event": "val_setup", "val_windows": len(val_gpu),
                           "val_interval_steps": val_interval}), flush=True)
@@ -1480,6 +1531,9 @@ def main() -> None:
         "data_seed": data_seed,
         "world_size": world_size,
         "steps_total": steps_total,
+        "lr_schedule_steps": lr_schedule_steps,
+        "warmup_steps": warmup_steps,
+        "val_interval_steps": val_interval,
     }
 
     def save_resumable(step: int):
