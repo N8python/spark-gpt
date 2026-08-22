@@ -9,6 +9,7 @@ from train import (
     build_whole_document_batches,
     materialize_packed_batch,
     packed_batch_metadata,
+    resolve_run_steps,
     resolve_training_schedule,
 )
 
@@ -84,6 +85,16 @@ class WholeDocumentPackingTest(unittest.TestCase):
 
 
 class TrainingScheduleTest(unittest.TestCase):
+    def test_step_limit_preserves_available_schedule_by_default(self):
+        self.assertEqual(resolve_run_steps(20644, None), 20644)
+
+    def test_step_limit_can_select_exact_prefix(self):
+        self.assertEqual(resolve_run_steps(20644, 2065), 2065)
+
+    def test_step_limit_rejects_unavailable_steps(self):
+        with self.assertRaisesRegex(ValueError, "exceeds the available"):
+            resolve_run_steps(20644, 20645)
+
     def test_defaults_follow_actual_run_length(self):
         schedule, warmup, val_interval = resolve_training_schedule(
             2067,

@@ -1052,6 +1052,19 @@ def resolve_training_schedule(
     return schedule_steps, warmup_steps, resolved_val_interval
 
 
+def resolve_run_steps(available_steps: int, max_train_steps: int | None) -> int:
+    """Limit execution without changing the shuffled data schedule itself."""
+    if available_steps <= 0:
+        raise ValueError("available training steps must be positive")
+    if max_train_steps is None:
+        return available_steps
+    if max_train_steps <= 0:
+        raise ValueError("--max-train-steps must be positive")
+    if max_train_steps > available_steps:
+        raise ValueError("--max-train-steps exceeds the available training steps")
+    return max_train_steps
+
+
 # --------------------------------------------------------------------------- #
 # Trainer
 # --------------------------------------------------------------------------- #
@@ -1126,6 +1139,11 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--target-tokens", type=int, default=1_000_000_000,
                    help="loss-token budget (global, before rank sharding); default = 1B, "
                         "i.e. Chinchilla-optimal for the default 50M model")
+    p.add_argument(
+        "--max-train-steps", type=int, default=None,
+        help="stop after this many optimizer steps while retaining the data schedule "
+             "built from --target-tokens (default: execute the complete schedule)",
+    )
     # model (defaults = 50M; see docstring for the 0.6B flag set)
     p.add_argument("--model-layers", type=int, default=16)
     p.add_argument("--model-dim", type=int, default=512)
@@ -1295,9 +1313,14 @@ def main() -> None:
     global_batch_order.extend([-1] * ddp_filler_batches)
     scheduled_batches = len(global_batch_order)
     window_order = global_batch_order[rank::world_size]
-    steps_total = len(window_order)
-    training_real_tokens = sum(batch.real_tokens for batch in train_batches)
-    training_compute_tokens = scheduled_batches * window
+    available_steps = len(window_order)
+    steps_total = resolve_run_steps(available_steps, args.max_train_steps)
+    window_order = window_order[:steps_total]
+    executed_global_order = global_batch_order[:steps_total * world_size]
+    training_real_tokens = sum(
+        train_batches[w].real_tokens for w in executed_global_order if w >= 0
+    )
+    training_compute_tokens = steps_total * world_size * window
     packing_utilization = training_real_tokens / training_compute_tokens
     lr_schedule_steps, warmup_steps, val_interval = resolve_training_schedule(
         steps_total,
@@ -1401,6 +1424,8 @@ def main() -> None:
         "packed_real_batches": len(train_batches),
         "ddp_filler_batches": ddp_filler_batches,
         "scheduled_batches": scheduled_batches,
+        "available_steps_per_rank": available_steps,
+        "executed_scheduled_batches": steps_total * world_size,
         "real_tokens_used": training_real_tokens,
         "padding_compute_tokens": training_compute_tokens - training_real_tokens,
         "packing_utilization": packing_utilization,
@@ -1527,6 +1552,7 @@ def main() -> None:
         "packing_format": PACKING_FORMAT,
         "scheduled_batches": scheduled_batches,
         "ddp_filler_batches": ddp_filler_batches,
+        "available_steps": available_steps,
         "real_tokens_used": training_real_tokens,
         "data_seed": data_seed,
         "world_size": world_size,
