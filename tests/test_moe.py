@@ -65,12 +65,11 @@ class RouterTest(unittest.TestCase):
         with torch.no_grad():
             experts.gate_up_proj.normal_(0.0, 0.2)
             experts.down_proj.normal_(0.0, 0.2)
-        hidden = torch.randn(5, 4)
+        hidden = torch.randn(5, 4, requires_grad=True)
         selected = torch.tensor([[0, 1], [2, 0], [1, 2], [0, 2], [1, 0]])
         weights = torch.tensor([
             [0.7, 0.3], [0.6, 0.4], [0.8, 0.2], [0.55, 0.45], [0.9, 0.1]
         ])
-        actual = experts(hidden, selected, weights)
         expected = torch.zeros_like(hidden)
         for token in range(hidden.shape[0]):
             for slot in range(selected.shape[1]):
@@ -82,7 +81,21 @@ class RouterTest(unittest.TestCase):
                     F.silu(gate) * up, experts.down_proj[expert]
                 )
                 expected[token] += weights[token, slot] * expert_output
+        actual = experts(hidden, selected, weights)
         torch.testing.assert_close(actual, expected)
+
+        probe = torch.randn_like(actual)
+        differentiable_inputs = (
+            hidden, experts.gate_up_proj, experts.down_proj,
+        )
+        actual_grads = torch.autograd.grad(
+            (actual * probe).sum(), differentiable_inputs, retain_graph=True
+        )
+        expected_grads = torch.autograd.grad(
+            (expected * probe).sum(), differentiable_inputs
+        )
+        for actual_grad, expected_grad in zip(actual_grads, expected_grads):
+            torch.testing.assert_close(actual_grad, expected_grad)
 
 
 class AuxiliaryLossTest(unittest.TestCase):
@@ -238,6 +251,41 @@ class InitializationOptimizerExportTest(unittest.TestCase):
     "CUDA grouped_mm is required",
 )
 class CudaGroupedMMTest(unittest.TestCase):
+    def test_output_scatter_matches_inverse_gather(self):
+        torch.manual_seed(0)
+        num_tokens, top_k, hidden_dim = 256, 2, 128
+        selected = torch.randint(0, 8, (num_tokens, top_k), device="cuda")
+        _, permutation = torch.sort(selected.reshape(-1))
+        expert_output = torch.randn(
+            num_tokens * top_k, hidden_dim,
+            device="cuda", dtype=torch.bfloat16, requires_grad=True,
+        )
+
+        inverse_permutation = torch.empty_like(permutation)
+        inverse_permutation[permutation] = torch.arange(
+            permutation.numel(), device="cuda"
+        )
+        expected = expert_output[inverse_permutation].view(
+            num_tokens, top_k, hidden_dim
+        ).sum(dim=1)
+        ordered_output = torch.empty_like(expert_output)
+        ordered_output[permutation] = expert_output
+        actual = ordered_output.view(
+            num_tokens, top_k, hidden_dim
+        ).sum(dim=1)
+        torch.testing.assert_close(actual, expected, rtol=0.0, atol=0.0)
+
+        probe = torch.randn_like(actual)
+        actual_grad, = torch.autograd.grad(
+            (actual * probe).sum(), expert_output, retain_graph=True
+        )
+        expected_grad, = torch.autograd.grad(
+            (expected * probe).sum(), expert_output
+        )
+        torch.testing.assert_close(
+            actual_grad, expected_grad, rtol=0.0, atol=0.0
+        )
+
     def test_unused_experts_have_zero_finite_gradients(self):
         config = tiny_config(hidden_size=128, num_hidden_layers=1,
                              intermediate_size=384, num_attention_heads=2,

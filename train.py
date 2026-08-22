@@ -282,10 +282,13 @@ class Experts(nn.Module):
         flat_experts = selected_experts.reshape(-1)
         flat_weights = routing_weights.reshape(-1)
         sorted_experts, permutation = torch.sort(flat_experts)
-        sorted_hidden = hidden_states[permutation // top_k]
+        sorted_token_indices = permutation // top_k
+        sorted_hidden = hidden_states[sorted_token_indices]
         sorted_weights = flat_weights[permutation]
-
-        histc_input = sorted_experts.int() if hidden_states.is_cuda else sorted_experts.float()
+        histc_input = (
+            sorted_experts.int() if hidden_states.is_cuda
+            else sorted_experts.float()
+        )
         tokens_per_expert = torch.histc(
             histc_input,
             bins=self.num_experts,
@@ -303,11 +306,11 @@ class Experts(nn.Module):
         )
         expert_output = expert_output * sorted_weights.unsqueeze(-1)
 
-        inverse_permutation = torch.empty_like(permutation)
-        inverse_permutation[permutation] = torch.arange(
-            permutation.numel(), device=permutation.device
-        )
-        return expert_output[inverse_permutation].view(
+        # Restore assignment order directly, avoiding an inverse-permutation
+        # tensor followed by an indexed gather before the top-k reduction.
+        ordered_output = torch.empty_like(expert_output)
+        ordered_output[permutation] = expert_output
+        return ordered_output.view(
             num_tokens, top_k, self.hidden_dim
         ).sum(dim=1).to(dtype=hidden_states.dtype)
 
