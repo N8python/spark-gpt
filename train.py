@@ -58,6 +58,14 @@ Hard-won GB10 (sm_121) facts -- do not relearn these:
     cu_seqlens' varying length must be mark_dynamic'd, else a silent
     recompile-limit eager fallback costs 2x throughput and +30 GB.
   * muon-lr 1e-2 (the old 20M-model default) diverges at 440M without muP.
+  * cuBLAS batched bf16 bmm/baddbmm is mis-tuned on sm_121 for the Muon
+    Newton-Schulz stacks (32x32 wmma kernels, ~19-34 TFLOP/s, and baddbmm
+    copies its bias matrix into the output first); the hand-written Triton
+    batched GEMM in _newtonschulz5_batched runs them at 51-64 TFLOP/s with
+    bit-identical results. Keep its tile configs shape-derived (never
+    autotuned) so DDP ranks stay bit-identical.
+  * flash-attn >= 2.7 varlen is a torch custom op: keep it INSIDE the
+    compiled graph (one graph per fwd/bwd), with cu_seqlens mark_dynamic'd.
 
 Checkpoints: --save-final writes model_final.pt (native fused layout) plus a
 READY-TO-LOAD HF directory checkpoints/<run>/hf/ (stock Qwen3ForCausalLM or
