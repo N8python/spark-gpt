@@ -108,8 +108,8 @@ torchrun --nnodes 2 --node-rank <0|1> --nproc-per-node 1 \
 ```
 
 Defaults are a 50M model (16 layers / 512 dim / 4Q+2KV heads / head_dim 128)
-on 1B tokens — about 4h on one GB10, 2h on two (~140k tok/s, ~1.95×
-single-node). The Qwen3-0.6B shape (440M non-embedding params) is
+on 1B tokens — about 3h on one GB10 (~94-99k tok/s), ~1.5h on two (~192k
+aggregate, ~1.95× single-node). The Qwen3-0.6B shape (440M non-embedding params) is
 `--model-layers 28 --model-dim 1024 --attention-heads 16 --kv-heads 8
 --intermediate-size 3072` — same hyperparameters, muP transfers them.
 
@@ -165,27 +165,39 @@ tok = AutoTokenizer.from_pretrained("checkpoints/my_run/hf")
 
 Hard-won facts, also documented in the train.py docstring: keep
 `torch.compile` on mode `default` (`reduce-overhead`'s CUDA-graph pools OOM
-unified memory; `max-autotune` is ~6.5% slower than `default` on sm_121), fp8
-matmuls are a net loss below ~2048 hidden dim (dynamic-scaling casts are
+unified memory; `max-autotune` never actually tried Triton GEMMs on the 48-SM
+GB10 because of inductor's 68-SM gate — `--autotune-gemm`, on by default,
+bypasses that gate and lets inductor pick Triton or cuBLAS per GEMM shape),
+fp8 matmuls are a net loss below ~2048 hidden dim (dynamic-scaling casts are
 bandwidth-bound), and always set
-`PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True`. At the 0.6B shape the
+`PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True`. The dense MLP and the
+MoE experts run on hand-written Triton grouped GEMMs with the SwiGLU fused
+into the epilogue (`--fused-swiglu`, on by default; `torch._grouped_mm` is a
+host-synchronizing per-expert cuBLAS loop on sm_121). GEMM autotuning
+benchmarks on every rank; identical GB10s pick identical kernels (2-node
+checkpoints verified bit-identical), but on heterogeneous nodes use
+`--no-autotune-gemm`. At the 0.6B shape the
 trainer sustains ~14.0k tok/s on a single GB10 at the default 49,152-token
 window (torch 2.12.0+cu130, flash-attn 2.8.3.post1). That is fixed-shape
 compute-token throughput; real loss-token throughput is reported separately
 and equals compute throughput times observed packing utilization.
 
-Controlled 2026-08-21 single-GB10 comparison on the same checksum-pinned
-FineWeb stream (`seed=0`, 5,001,341 real tokens, 104 post-prewarm steps,
-49,152 tokens/step, compile `default`):
+Single-GB10 comparison on the same checksum-pinned FineWeb stream (`seed=0`,
+5,001,341 real tokens, 104 steps, 49,152 tokens/step, compile `default`,
+steady window tok/s over the second half of the run), before and after the
+2026-08-23 kernel work (see [CHANGES.md](CHANGES.md)):
 
-| Model | Total params | Active params | Real tok/s | Window tok/s | Peak allocation |
+| Model | Total params | Active params | Window tok/s @ `40096c0` | Window tok/s now | Peak allocation |
 | --- | ---: | ---: | ---: | ---: | ---: |
-| Dense 16L/512d/MLP1536 | 50,617,856 | 50,617,856 | 81,606 | 83,408 | 14.08 GiB |
-| MoE 8 experts/top-2/I768 | 163,929,600 | 50,683,392 | 56,530 | 57,779 | 18.14 GiB |
+| Dense 16L/512d/MLP1536 | 50,617,856 | 50,617,856 | 83.7k | **96.8k-99.3k** | 14.0 GiB |
+| MoE 8 experts/top-2/I768 | 163,929,600 | 50,683,392 | 59.3k | **72.4k-74.5k** | 18.1 GiB |
 
-The compute-matched MoE delivered 69.27% of dense throughput (30.73% slower)
-and used 4.06 GiB more peak allocation. This isolates training systems cost;
-the short run is not a model-quality comparison.
+Dense numbers vary by about ±1% between compiles (GEMM autotune picks), so
+they are quoted as ranges. The compute-matched MoE now delivers ~75% of dense
+throughput (was 69%). Matched 1B-token runs of both defaults (base vs this
+tree, same seed, held-out validation every 5%) end within 0.002 nats/byte of
+each other — MoE 0.7443 vs 0.7434, dense 0.7737 vs 0.7717 — at 20% (MoE) and
+15% (dense) less wall time; the optimizations do not change what is trained.
 
 ## License
 
