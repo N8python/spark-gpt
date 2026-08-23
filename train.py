@@ -748,34 +748,36 @@ class MuonAdamWHybrid(torch.optim.Optimizer):
             if "v" not in state:
                 state["v"] = torch.zeros_like(p, dtype=torch.float32)
             vs.append(state["v"])
-        # lerp evaluates the same momentum recurrences in one multi-tensor
-        # pass instead of a multiply pass followed by an add pass.
+        # lerp evaluates the momentum recurrence in one multi-tensor pass
+        # instead of a multiply pass followed by an add pass.
         torch._foreach_lerp_(vs, grads, 1 - momentum)
-        if group["nesterov"]:
-            # Gradients are dead after optimizer.step (the trainer clears them
-            # before the next forward), so reuse their storage for the
-            # Nesterov update instead of allocating another full model-sized
-            # fp32 tensor list.
-            updates = grads
-            torch._foreach_lerp_(updates, vs, momentum)
-        else:
-            updates = [v.clone() for v in vs]
 
         by_shape: dict[tuple[int, int, int], list] = {}
-        for p, u in zip(params, updates):
-            if u.ndim not in (2, 3):
-                raise ValueError(f"Muon requires 2-D or 3-D parameters, got {u.shape}")
-            by_shape.setdefault((u.ndim, u.shape[-2], u.shape[-1]), []).append((p, u))
+        for p, g, v in zip(params, grads, vs):
+            if p.ndim not in (2, 3):
+                raise ValueError(f"Muon requires 2-D or 3-D parameters, got {p.shape}")
+            by_shape.setdefault((p.ndim, p.shape[-2], p.shape[-1]), []).append((p, g, v))
         for (ndim, rows, cols), items in by_shape.items():
-            batch_sizes = [1 if ndim == 2 else u.shape[0] for _, u in items]
+            batch_sizes = [1 if ndim == 2 else p.shape[0] for p, _, _ in items]
             stacked = torch.empty(
-                (sum(batch_sizes), rows, cols), device=items[0][1].device,
+                (sum(batch_sizes), rows, cols), device=items[0][0].device,
                 dtype=torch.bfloat16,
             )
             offset = 0
-            for (_, update), batch_size in zip(items, batch_sizes):
-                source = update.unsqueeze(0) if ndim == 2 else update
-                stacked[offset : offset + batch_size].copy_(source)
+            for (p, g, v), batch_size in zip(items, batch_sizes):
+                if ndim == 2:
+                    g, v = g.unsqueeze(0), v.unsqueeze(0)
+                staged = stacked[offset : offset + batch_size]
+                # The Nesterov update lerp(g, v, momentum) is written straight
+                # into the bf16 Newton-Schulz staging stack (fp32 math, one
+                # rounding): one read of g and v and one half-size write,
+                # instead of a second full fp32 lerp pass over the gradients
+                # followed by a cast copy. The optimizer step is bandwidth
+                # bound on GB10, so these passes are most of its non-GEMM time.
+                if group["nesterov"]:
+                    torch.lerp(g, v, momentum, out=staged)
+                else:
+                    staged.copy_(v)
                 offset += batch_size
             ortho = _newtonschulz5_batched(stacked, steps=group["ns_steps"])
             # aspect-ratio factor; also what makes Muon lr width-invariant
@@ -785,7 +787,7 @@ class MuonAdamWHybrid(torch.optim.Optimizer):
             else:
                 ortho_updates = list(ortho.split(batch_sizes, dim=0))
             torch._foreach_add_(
-                [p for p, _ in items],
+                [p for p, _, _ in items],
                 ortho_updates,
                 alpha=-lr,
             )
