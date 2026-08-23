@@ -132,11 +132,14 @@ class RMSNorm(nn.Module):
         return out.to(dtype=x.dtype) * self.weight.to(dtype=x.dtype)
 
 
-@torch._dynamo.disable
 def _varlen_attention(q, k, v, cu_seqlens, max_seqlen):
-    """Eager island: block-diagonal causal attention over packed segments.
-    cu_seqlens has a data-dependent LENGTH (docs per window) and must stay
-    outside the compiled graph to avoid per-window recompiles."""
+    """Block-diagonal causal attention over packed segments.
+
+    flash-attn >= 2.7 registers its varlen kernels as torch custom ops, so
+    this traces into the compiled graph (one graph per forward/backward
+    instead of a graph break per layer). cu_seqlens has a data-dependent
+    LENGTH (docs per window); the trainer marks that dim dynamic so no
+    per-window recompile occurs."""
     return flash_attn_varlen_func(
         q, k, v,
         cu_seqlens_q=cu_seqlens, cu_seqlens_k=cu_seqlens,
