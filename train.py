@@ -48,7 +48,19 @@ Canonical runs:
 
 Hard-won GB10 (sm_121) facts -- do not relearn these:
   * compile mode "default" only: reduce-overhead's cudagraph pools OOM unified
-    memory, and max-autotune is ~6.5% SLOWER than default (triton < cuBLAS).
+    memory. mode "max-autotune" never tried Triton GEMMs here at all: inductor's
+    is_big_gpu() gate (>= 68 SMs) silently disables its GEMM templates on the
+    48-SM GB10. With the gate bypassed (--autotune-gemm, default on) Triton
+    beats cuBLAS on the output-heavy shapes (+4.3% dense); cuBLAS addmm with a
+    matrix bias is 1.8-2.5x slower than mm on sm_121, so residual-add-after-
+    GEMM is exactly where the Triton template wins most.
+  * torch._grouped_mm on sm_121 is the host-synchronizing per-expert cuBLAS
+    fallback; the Triton grouped GEMMs in this file (device offsets, fused
+    SwiGLU epilogue, natural-layout weight gradient) are 13-31% faster per
+    expert GEMM and free the CPU. Inductor's own grouped template (TMA loads)
+    loses to aten on the 2d x 3d expert shapes; its prologue-fusion heuristics
+    refuse the SwiGLU backward (reads > writes, fp32 math), so only the
+    forward fusion is reachable through the compiler.
   * fp8 is a net loss at dim 1024 (dynamic-scaling casts are bandwidth-bound;
     273 GB/s). Revisit at dim >= 2048.
   * Embedding is not autocast by PyTorch. Cast its output to the active
@@ -207,8 +219,462 @@ class MLP(nn.Module):
         self.down_proj = nn.Linear(hidden_dim, dim, bias=False)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
+        if _use_fused_swiglu(x):
+            weight = self.gate_up_proj.weight.to(dtype=x.dtype).unsqueeze(0)
+            offs = torch.full((1,), x.shape[0], device=x.device, dtype=torch.int32)
+            return self.down_proj(_FusedSwiGLU.apply(x, weight, offs))
         gate, up = self.gate_up_proj(x).chunk(2, dim=-1)
         return self.down_proj(F.silu(gate) * up)
+
+
+# --------------------------------------------------------------------------- #
+# Fused SwiGLU grouped GEMM (Triton): h = silu(x W_gate^T) * (x W_up^T)
+# --------------------------------------------------------------------------- #
+try:  # inductor inlines user Triton kernels and expects the `triton`/`tl` names
+    import triton
+    import triton.language as tl
+except ImportError:  # pragma: no cover - CPU-only environments
+    triton = None
+
+
+FUSED_SWIGLU = True  # --no-fused-swiglu falls back to GEMM + separate SwiGLU
+
+
+def _use_fused_swiglu(x: torch.Tensor) -> bool:
+    return FUSED_SWIGLU and triton is not None and x.is_cuda and x.dtype == torch.bfloat16
+
+
+@triton.jit
+def _swiglu_gemm_kernel(
+    X, W, OFFS, GU, H,
+    K, I,
+    stride_xr, stride_xk,
+    stride_we, stride_wn, stride_wk,
+    stride_gur, stride_gun,
+    stride_hr, stride_hn,
+    E: tl.constexpr, BLOCK_M: tl.constexpr, BLOCK_N: tl.constexpr, BLOCK_K: tl.constexpr,
+    GROUP_M: tl.constexpr, WRITE_GU: tl.constexpr,
+):
+    pid = tl.program_id(0)
+    num_n = tl.cdiv(I, BLOCK_N)
+    # ---- locate this program's (expert, m tile, n tile) ----------------
+    # tiles are laid out expert by expert; each expert has cdiv(rows_e, BLOCK_M)
+    # m tiles.  The grid is sized for the worst case, so trailing programs
+    # may find no tile and exit.
+    tile = pid
+    row_start = 0
+    expert = 0
+    found = False
+    m_tile = 0
+    n_tile = 0
+    rows_e = 0
+    for e in tl.static_range(E):
+        end = tl.load(OFFS + e)
+        n_rows = end - row_start
+        n_m = tl.cdiv(n_rows, BLOCK_M)
+        n_tiles = n_m * num_n
+        if (not found) and (tile < n_tiles):
+            found = True
+            expert = e
+            rows_e = n_rows
+            # grouped ordering within the expert for L2 reuse of X rows
+            group_size = GROUP_M * num_n
+            group_id = tile // group_size
+            first_m = group_id * GROUP_M
+            gsz = tl.minimum(n_m - first_m, GROUP_M)
+            m_tile = first_m + (tile % group_size) % gsz
+            n_tile = (tile % group_size) // gsz
+        if not found:
+            tile = tile - n_tiles
+            row_start = end
+    if not found:
+        return
+    # ---- main loop -------------------------------------------------------
+    rm = m_tile * BLOCK_M + tl.arange(0, BLOCK_M)
+    rn = n_tile * BLOCK_N + tl.arange(0, BLOCK_N)
+    rk = tl.arange(0, BLOCK_K)
+    row_mask = rm < rows_e
+    x_ptrs = X + (row_start + rm)[:, None] * stride_xr + rk[None, :] * stride_xk
+    wg_ptrs = W + expert * stride_we + rn[None, :] * stride_wn + rk[:, None] * stride_wk
+    wu_ptrs = W + expert * stride_we + (rn + I)[None, :] * stride_wn + rk[:, None] * stride_wk
+    acc_g = tl.zeros((BLOCK_M, BLOCK_N), dtype=tl.float32)
+    acc_u = tl.zeros((BLOCK_M, BLOCK_N), dtype=tl.float32)
+    n_mask = rn < I
+    for k0 in range(0, K, BLOCK_K):
+        k_mask = (k0 + rk) < K
+        x = tl.load(x_ptrs, mask=row_mask[:, None] & k_mask[None, :], other=0.0)
+        wg = tl.load(wg_ptrs, mask=k_mask[:, None] & n_mask[None, :], other=0.0)
+        wu = tl.load(wu_ptrs, mask=k_mask[:, None] & n_mask[None, :], other=0.0)
+        acc_g = tl.dot(x, wg, acc_g)
+        acc_u = tl.dot(x, wu, acc_u)
+        x_ptrs += BLOCK_K * stride_xk
+        wg_ptrs += BLOCK_K * stride_wk
+        wu_ptrs += BLOCK_K * stride_wk
+    # ---- epilogue --------------------------------------------------------
+    g16 = acc_g.to(tl.bfloat16)
+    u16 = acc_u.to(tl.bfloat16)
+    out_mask = row_mask[:, None] & n_mask[None, :]
+    rows = row_start + rm
+    if WRITE_GU:
+        tl.store(GU + rows[:, None] * stride_gur + rn[None, :] * stride_gun, g16, mask=out_mask)
+        tl.store(GU + rows[:, None] * stride_gur + (rn + I)[None, :] * stride_gun, u16, mask=out_mask)
+    g = g16.to(tl.float32)
+    u = u16.to(tl.float32)
+    h = g * tl.sigmoid(g) * u
+    tl.store(H + rows[:, None] * stride_hr + rn[None, :] * stride_hn, h.to(tl.bfloat16), mask=out_mask)
+
+
+def _swiglu_gemm(x, w, offs, *, write_gu=True, BLOCK_M=64, BLOCK_N=64, BLOCK_K=32,
+                GROUP_M=8, num_warps=4, num_stages=3):
+    """x (R, K) bf16 sorted by group, w (E, 2I, K) bf16, offs (E,) int32 -> (gu, h)."""
+    R, K = x.shape
+    E, twoI, _ = w.shape
+    I = twoI // 2
+    gu = torch.empty(R, twoI, device=x.device, dtype=x.dtype) if write_gu else None
+    h = torch.empty(R, I, device=x.device, dtype=x.dtype)
+    max_tiles = (triton.cdiv(R, BLOCK_M) + E) * triton.cdiv(I, BLOCK_N)
+    _swiglu_gemm_kernel[(max_tiles,)](
+        x, w, offs, gu if write_gu else h, h,
+        K, I,
+        x.stride(0), x.stride(1),
+        w.stride(0), w.stride(1), w.stride(2),
+        gu.stride(0) if write_gu else 0, gu.stride(1) if write_gu else 0,
+        h.stride(0), h.stride(1),
+        E=E, BLOCK_M=BLOCK_M, BLOCK_N=BLOCK_N, BLOCK_K=BLOCK_K, GROUP_M=GROUP_M,
+        WRITE_GU=write_gu, num_warps=num_warps, num_stages=num_stages,
+    )
+    return gu, h
+
+
+
+
+@triton.jit
+def _grouped_gemm_kernel(
+    X, W, OFFS, OUT, K, N,
+    stride_xr, stride_xk, stride_we, stride_wn, stride_wk, stride_or, stride_on,
+    E: tl.constexpr, BLOCK_M: tl.constexpr, BLOCK_N: tl.constexpr, BLOCK_K: tl.constexpr,
+    GROUP_M: tl.constexpr,
+):
+    """OUT[r] = X[r] @ B_e^T for rows r of group e, B_e[n, k] = W[e, n, k] (any strides)."""
+    pid = tl.program_id(0)
+    num_n = tl.cdiv(N, BLOCK_N)
+    tile = pid
+    row_start = 0
+    expert = 0
+    found = False
+    m_tile = 0
+    n_tile = 0
+    rows_e = 0
+    for e in tl.static_range(E):
+        end = tl.load(OFFS + e)
+        n_rows = end - row_start
+        n_m = tl.cdiv(n_rows, BLOCK_M)
+        n_tiles = n_m * num_n
+        if (not found) and (tile < n_tiles):
+            found = True
+            expert = e
+            rows_e = n_rows
+            group_size = GROUP_M * num_n
+            group_id = tile // group_size
+            first_m = group_id * GROUP_M
+            gsz = tl.minimum(n_m - first_m, GROUP_M)
+            m_tile = first_m + (tile % group_size) % gsz
+            n_tile = (tile % group_size) // gsz
+        if not found:
+            tile = tile - n_tiles
+            row_start = end
+    if not found:
+        return
+    rm = m_tile * BLOCK_M + tl.arange(0, BLOCK_M)
+    rn = n_tile * BLOCK_N + tl.arange(0, BLOCK_N)
+    rk = tl.arange(0, BLOCK_K)
+    row_mask = rm < rows_e
+    n_mask = rn < N
+    x_ptrs = X + (row_start + rm)[:, None] * stride_xr + rk[None, :] * stride_xk
+    w_ptrs = W + expert * stride_we + rn[None, :] * stride_wn + rk[:, None] * stride_wk
+    acc = tl.zeros((BLOCK_M, BLOCK_N), dtype=tl.float32)
+    for k0 in range(0, K, BLOCK_K):
+        k_mask = (k0 + rk) < K
+        x = tl.load(x_ptrs, mask=row_mask[:, None] & k_mask[None, :], other=0.0)
+        w = tl.load(w_ptrs, mask=k_mask[:, None] & n_mask[None, :], other=0.0)
+        acc = tl.dot(x, w, acc)
+        x_ptrs += BLOCK_K * stride_xk
+        w_ptrs += BLOCK_K * stride_wk
+    rows = row_start + rm
+    tl.store(OUT + rows[:, None] * stride_or + rn[None, :] * stride_on, acc.to(tl.bfloat16),
+             mask=row_mask[:, None] & n_mask[None, :])
+
+
+def _grouped_gemm(x, w, offs, *, transpose_w=False):
+    """x (R, K) bf16 with rows sorted by group; w (E, N, K) bf16, or (E, K, N)
+    with transpose_w=True (read through strides, no copy); offs (E,) int32
+    cumulative row counts -> (R, N) bf16.  Device-side offsets: no host sync.
+    Tile configs are the measured best for the default MoE shapes on GB10."""
+    R, K = x.shape
+    E = w.shape[0]
+    N = w.shape[2] if transpose_w else w.shape[1]
+    se, sn, sk = (w.stride(0), w.stride(2), w.stride(1)) if transpose_w else w.stride()
+    if N <= 512 and K >= 1024:
+        bm, bn, bk, warps = 64, 128, 64, 8
+    else:
+        bm, bn, bk, warps = 64, 256, 32, 4
+    out = torch.empty(R, N, device=x.device, dtype=x.dtype)
+    max_tiles = (triton.cdiv(R, bm) + E) * triton.cdiv(N, bn)
+    _grouped_gemm_kernel[(max_tiles,)](
+        x, w, offs, out, K, N, x.stride(0), x.stride(1), se, sn, sk, out.stride(0), out.stride(1),
+        E=E, BLOCK_M=bm, BLOCK_N=bn, BLOCK_K=bk, GROUP_M=8, num_warps=warps, num_stages=3,
+    )
+    return out
+
+
+@triton.jit
+def _grouped_wgrad_kernel(
+    A, B, OFFS, OUT, N, K,
+    stride_ar, stride_an, stride_br, stride_bk, stride_oe, stride_on, stride_ok,
+    E: tl.constexpr, BLOCK_R: tl.constexpr, BLOCK_N: tl.constexpr, BLOCK_K: tl.constexpr,
+):
+    """OUT[e, n, k] = sum over rows r of group e of A[r, n] * B[r, k]: the
+    grouped weight gradient, reading A and B in their natural row-major
+    layout (no transposed copy of the (R, N) activation gradient)."""
+    pid = tl.program_id(0)
+    num_n = tl.cdiv(N, BLOCK_N)
+    num_k = tl.cdiv(K, BLOCK_K)
+    expert = pid // (num_n * num_k)
+    rem = pid % (num_n * num_k)
+    n_tile = rem // num_k
+    k_tile = rem % num_k
+    row_start = 0
+    if expert > 0:
+        row_start = tl.load(OFFS + expert - 1)
+    row_end = tl.load(OFFS + expert)
+    rn = n_tile * BLOCK_N + tl.arange(0, BLOCK_N)
+    rk = k_tile * BLOCK_K + tl.arange(0, BLOCK_K)
+    rr = tl.arange(0, BLOCK_R)
+    n_mask = rn < N
+    k_mask = rk < K
+    acc = tl.zeros((BLOCK_N, BLOCK_K), dtype=tl.float32)
+    for r0 in range(row_start, row_end, BLOCK_R):
+        rows = r0 + rr
+        r_mask = rows < row_end
+        a = tl.load(A + rows[:, None] * stride_ar + rn[None, :] * stride_an,
+                    mask=r_mask[:, None] & n_mask[None, :], other=0.0)
+        b = tl.load(B + rows[:, None] * stride_br + rk[None, :] * stride_bk,
+                    mask=r_mask[:, None] & k_mask[None, :], other=0.0)
+        acc = tl.dot(tl.trans(a), b, acc)
+    tl.store(OUT + expert * stride_oe + rn[:, None] * stride_on + rk[None, :] * stride_ok,
+             acc.to(tl.bfloat16), mask=n_mask[:, None] & k_mask[None, :])
+
+
+def _grouped_wgrad(grad_out, x, offs):
+    """grad_out (R, N), x (R, K) bf16 with rows sorted by group -> (E, N, K) bf16."""
+    R, N = grad_out.shape
+    K = x.shape[1]
+    E = offs.numel()
+    out = torch.empty(E, N, K, device=x.device, dtype=x.dtype)
+    bn = bk = 128
+    grid = (E * triton.cdiv(N, bn) * triton.cdiv(K, bk),)
+    _grouped_wgrad_kernel[grid](
+        grad_out, x, offs, out, N, K, grad_out.stride(0), grad_out.stride(1),
+        x.stride(0), x.stride(1), out.stride(0), out.stride(1), out.stride(2),
+        E=E, BLOCK_R=64, BLOCK_N=bn, BLOCK_K=bk, num_warps=4, num_stages=3,
+    )
+    return out
+
+
+class _GroupedLinear(torch.autograd.Function):
+    """Expert down projection: out[r] = h[r] @ W_e^T, W (E, N, K), rows sorted by
+    group.  Forward and dgrad use the Triton grouped GEMM above (faster than
+    the sm_121 aten fallback and free of its host sync); the weight gradient
+    uses the grouped wgrad kernel, which reads the activation gradient in its
+    natural layout instead of forcing a transposed copy of it."""
+
+    @staticmethod
+    def forward(ctx, h, weight, offs):
+        ctx.save_for_backward(h, weight, offs)
+        return _grouped_gemm(h, weight, offs)
+
+    @staticmethod
+    def backward(ctx, dout):
+        h, weight, offs = ctx.saved_tensors
+        dh = _grouped_gemm(dout, weight, offs, transpose_w=True)
+        dw = _grouped_wgrad(dout, h, offs)
+        return dh, dw, None
+
+
+@triton.jit
+def _swiglu_tiles(g, u, dh):
+    sig = tl.sigmoid(g)
+    d_gate = dh * u * (sig * (1.0 + g * (1.0 - sig)))
+    d_up = dh * g * sig
+    return d_gate.to(tl.bfloat16), d_up.to(tl.bfloat16)
+
+
+@triton.jit
+def _swiglu_dgrad_kernel(
+    GU, DH, W, OFFS, OUT, I, N,
+    stride_gur, stride_dhr, stride_we, stride_wk, stride_wn, stride_or,
+    E: tl.constexpr, BLOCK_M: tl.constexpr, BLOCK_N: tl.constexpr, BLOCK_K: tl.constexpr,
+    GROUP_M: tl.constexpr,
+):
+    """OUT[r, n] = sum_k d_gu[r, k] * W[e, k, n], d_gu computed from GU/DH tiles."""
+    pid = tl.program_id(0)
+    num_n = tl.cdiv(N, BLOCK_N)
+    tile = pid
+    row_start = 0
+    expert = 0
+    found = False
+    m_tile = 0
+    n_tile = 0
+    rows_e = 0
+    for e in tl.static_range(E):
+        end = tl.load(OFFS + e)
+        n_rows = end - row_start
+        n_m = tl.cdiv(n_rows, BLOCK_M)
+        n_tiles = n_m * num_n
+        if (not found) and (tile < n_tiles):
+            found = True
+            expert = e
+            rows_e = n_rows
+            group_size = GROUP_M * num_n
+            group_id = tile // group_size
+            first_m = group_id * GROUP_M
+            gsz = tl.minimum(n_m - first_m, GROUP_M)
+            m_tile = first_m + (tile % group_size) % gsz
+            n_tile = (tile % group_size) // gsz
+        if not found:
+            tile = tile - n_tiles
+            row_start = end
+    if not found:
+        return
+    rm = m_tile * BLOCK_M + tl.arange(0, BLOCK_M)
+    rn = n_tile * BLOCK_N + tl.arange(0, BLOCK_N)
+    rk = tl.arange(0, BLOCK_K)
+    row_mask = rm < rows_e
+    n_mask = rn < N
+    rows = row_start + rm
+    g_ptrs = GU + rows[:, None] * stride_gur + rk[None, :]
+    u_ptrs = g_ptrs + I
+    dh_ptrs = DH + rows[:, None] * stride_dhr + rk[None, :]
+    wg_ptrs = W + expert * stride_we + rk[:, None] * stride_wk + rn[None, :] * stride_wn
+    wu_ptrs = wg_ptrs + I * stride_wk
+    acc = tl.zeros((BLOCK_M, BLOCK_N), dtype=tl.float32)
+    for k0 in range(0, I, BLOCK_K):
+        k_mask = (k0 + rk) < I
+        m = row_mask[:, None] & k_mask[None, :]
+        g = tl.load(g_ptrs, mask=m, other=0.0).to(tl.float32)
+        u = tl.load(u_ptrs, mask=m, other=0.0).to(tl.float32)
+        dh = tl.load(dh_ptrs, mask=m, other=0.0).to(tl.float32)
+        d_gate, d_up = _swiglu_tiles(g, u, dh)
+        wm = k_mask[:, None] & n_mask[None, :]
+        wg = tl.load(wg_ptrs, mask=wm, other=0.0)
+        wu = tl.load(wu_ptrs, mask=wm, other=0.0)
+        acc = tl.dot(d_gate, wg, acc)
+        acc = tl.dot(d_up, wu, acc)
+        g_ptrs += BLOCK_K
+        u_ptrs += BLOCK_K
+        dh_ptrs += BLOCK_K
+        wg_ptrs += BLOCK_K * stride_wk
+        wu_ptrs += BLOCK_K * stride_wk
+    tl.store(OUT + rows[:, None] * stride_or + rn[None, :], acc.to(tl.bfloat16),
+             mask=row_mask[:, None] & n_mask[None, :])
+
+
+@triton.jit
+def _swiglu_wgrad_kernel(
+    GU, DH, X, OFFS, OUT, I, K,
+    stride_gur, stride_dhr, stride_xr, stride_oe, stride_on, stride_ok,
+    E: tl.constexpr, BLOCK_R: tl.constexpr, BLOCK_N: tl.constexpr, BLOCK_K: tl.constexpr,
+):
+    """OUT[e, n, k] and OUT[e, I + n, k] = sum_r d_gate[r, n] x[r, k], d_up[r, n] x[r, k]."""
+    pid = tl.program_id(0)
+    num_n = tl.cdiv(I, BLOCK_N)
+    num_k = tl.cdiv(K, BLOCK_K)
+    expert = pid // (num_n * num_k)
+    rem = pid % (num_n * num_k)
+    n_tile = rem // num_k
+    k_tile = rem % num_k
+    row_start = 0
+    if expert > 0:
+        row_start = tl.load(OFFS + expert - 1)
+    row_end = tl.load(OFFS + expert)
+    rn = n_tile * BLOCK_N + tl.arange(0, BLOCK_N)
+    rk = k_tile * BLOCK_K + tl.arange(0, BLOCK_K)
+    rr = tl.arange(0, BLOCK_R)
+    n_mask = rn < I
+    k_mask = rk < K
+    acc_g = tl.zeros((BLOCK_N, BLOCK_K), dtype=tl.float32)
+    acc_u = tl.zeros((BLOCK_N, BLOCK_K), dtype=tl.float32)
+    for r0 in range(row_start, row_end, BLOCK_R):
+        rows = r0 + rr
+        r_mask = rows < row_end
+        m = r_mask[:, None] & n_mask[None, :]
+        g_off = rows[:, None] * stride_gur + rn[None, :]
+        g = tl.load(GU + g_off, mask=m, other=0.0).to(tl.float32)
+        u = tl.load(GU + g_off + I, mask=m, other=0.0).to(tl.float32)
+        dh = tl.load(DH + rows[:, None] * stride_dhr + rn[None, :], mask=m, other=0.0).to(tl.float32)
+        d_gate, d_up = _swiglu_tiles(g, u, dh)
+        x = tl.load(X + rows[:, None] * stride_xr + rk[None, :],
+                    mask=r_mask[:, None] & k_mask[None, :], other=0.0)
+        acc_g = tl.dot(tl.trans(d_gate), x, acc_g)
+        acc_u = tl.dot(tl.trans(d_up), x, acc_u)
+    out_mask = n_mask[:, None] & k_mask[None, :]
+    base = OUT + expert * stride_oe + rn[:, None] * stride_on + rk[None, :] * stride_ok
+    tl.store(base, acc_g.to(tl.bfloat16), mask=out_mask)
+    tl.store(base + I * stride_on, acc_u.to(tl.bfloat16), mask=out_mask)
+
+
+def _swiglu_dgrad(gu, dh, w, offs, *, BLOCK_M=64, BLOCK_N=64, BLOCK_K=32, num_warps=4, num_stages=3):
+    R, twoI = gu.shape
+    I = twoI // 2
+    E, _, N = w.shape
+    out = torch.empty(R, N, device=gu.device, dtype=gu.dtype)
+    grid = ((triton.cdiv(R, BLOCK_M) + E) * triton.cdiv(N, BLOCK_N),)
+    _swiglu_dgrad_kernel[grid](gu, dh, w, offs, out, I, N, gu.stride(0), dh.stride(0),
+                               w.stride(0), w.stride(1), w.stride(2), out.stride(0),
+                               E=E, BLOCK_M=BLOCK_M, BLOCK_N=BLOCK_N, BLOCK_K=BLOCK_K, GROUP_M=8,
+                               num_warps=num_warps, num_stages=num_stages)
+    return out
+
+
+def _swiglu_wgrad(gu, dh, x, offs, *, BLOCK_R=32, BLOCK_N=64, BLOCK_K=128, num_warps=4, num_stages=2):
+    R, twoI = gu.shape
+    I = twoI // 2
+    K = x.shape[1]
+    E = offs.numel()
+    out = torch.empty(E, twoI, K, device=gu.device, dtype=gu.dtype)
+    grid = (E * triton.cdiv(I, BLOCK_N) * triton.cdiv(K, BLOCK_K),)
+    _swiglu_wgrad_kernel[grid](gu, dh, x, offs, out, I, K, gu.stride(0), dh.stride(0), x.stride(0),
+                               out.stride(0), out.stride(1), out.stride(2),
+                               E=E, BLOCK_R=BLOCK_R, BLOCK_N=BLOCK_N, BLOCK_K=BLOCK_K,
+                               num_warps=num_warps, num_stages=num_stages)
+    return out
+
+
+
+class _FusedSwiGLU(torch.autograd.Function):
+    """One Triton kernel computes gate_up = x @ W_e^T per group and its SwiGLU
+    in the epilogue, writing gate_up (for the backward) and h.  Saves the
+    separate bandwidth-bound SwiGLU pass over the (R, 2I) activation that the
+    plain GEMM-then-pointwise formulation needs; the backward is the usual
+    SwiGLU derivative (fused by inductor) plus the dgrad/wgrad GEMMs.
+    Rounding points match the unfused path: gate_up rounded to bf16, SwiGLU
+    evaluated in fp32 from the rounded values."""
+
+    @staticmethod
+    def forward(ctx, x, weight, offs):
+        gu, h = _swiglu_gemm(x, weight, offs)
+        ctx.save_for_backward(x, weight, gu, offs)
+        return h
+
+    @staticmethod
+    def backward(ctx, dh):
+        x, weight, gu, offs = ctx.saved_tensors
+        dh = dh.contiguous()
+        # SwiGLU derivative computed inside both GEMM prologues: no d_gate_up
+        # buffer is ever written or re-read (7.6 -> 6.0 ms per dense layer).
+        dx = _swiglu_dgrad(gu, dh, weight, offs)
+        dw = _swiglu_wgrad(gu, dh, x, offs)
+        return dx, dw, None
 
 
 class TopKRouter(nn.Module):
@@ -272,6 +738,55 @@ def _grouped_linear(
     return torch.cat(outputs, dim=0)
 
 
+class _GatherTopK(torch.autograd.Function):
+    """rows = hidden[token_index] where every token appears exactly top_k
+    times.  The backward is therefore a plain gather + sum over the top_k slots
+    (deterministic, coalesced) instead of autograd's default sort-based
+    index_put_(accumulate=True)."""
+
+    @staticmethod
+    def forward(ctx, hidden, token_index, inverse_permutation, top_k):
+        ctx.save_for_backward(inverse_permutation)
+        ctx.top_k = top_k
+        return hidden[token_index]
+
+    @staticmethod
+    def backward(ctx, grad_rows):
+        (inverse_permutation,) = ctx.saved_tensors
+        return _sum_topk_rows(grad_rows, inverse_permutation, ctx.top_k), None, None, None
+
+
+def _sum_topk_rows(rows, inverse_permutation, top_k):
+    """out[t] = sum over the top_k slots of rows[inverse_permutation[t, s]].
+    (Measured: this gather -> view -> sum form compiles ~1.5% faster end to
+    end than top_k explicit per-slot gathers added pointwise.)"""
+    return rows[inverse_permutation].view(-1, top_k, rows.shape[-1]).sum(dim=1)
+
+
+class _CombineTopK(torch.autograd.Function):
+    """out[t] = sum_s w[j(t,s)] * rows[j(t,s)] for the top_k sorted rows j of
+    token t, using only gathers in both directions: the forward gathers the
+    weighted rows back into assignment order and sums the top_k slots; the
+    backward gathers grad_out by token index.  Autograd's default for the
+    same scatter would be an index_put into a zero-filled buffer forward and a
+    sort-based accumulation backward."""
+
+    @staticmethod
+    def forward(ctx, rows, weights, inverse_permutation, token_index, top_k):
+        ctx.save_for_backward(rows, weights, token_index)
+        ctx.top_k = top_k
+        weighted = rows * weights.unsqueeze(-1)
+        return _sum_topk_rows(weighted, inverse_permutation, top_k)
+
+    @staticmethod
+    def backward(ctx, grad_out):
+        rows, weights, token_index = ctx.saved_tensors
+        grad_rows_full = grad_out[token_index]
+        grad_rows = grad_rows_full * weights.unsqueeze(-1)
+        grad_weights = (grad_rows_full * rows).sum(dim=-1)
+        return grad_rows, grad_weights, None, None, None
+
+
 class Experts(nn.Module):
     """Packed Qwen3-MoE experts in the stock HF checkpoint layout."""
 
@@ -300,7 +815,13 @@ class Experts(nn.Module):
         flat_weights = routing_weights.reshape(-1)
         sorted_experts, permutation = torch.sort(flat_experts)
         sorted_token_indices = permutation // top_k
-        sorted_hidden = hidden_states[sorted_token_indices]
+        inverse_permutation = torch.empty_like(permutation)
+        inverse_permutation[permutation] = torch.arange(
+            permutation.numel(), device=permutation.device
+        )
+        sorted_hidden = _GatherTopK.apply(
+            hidden_states, sorted_token_indices, inverse_permutation, top_k
+        )
         sorted_weights = flat_weights[permutation]
         histc_input = (
             sorted_experts.int() if hidden_states.is_cuda
@@ -314,22 +835,25 @@ class Experts(nn.Module):
         )
         offsets = torch.cumsum(tokens_per_expert, dim=0, dtype=torch.int32)
 
-        gate, up = _grouped_linear(
-            sorted_hidden, self.gate_up_proj, offsets
-        ).chunk(2, dim=-1)
-        expert_hidden = F.silu(gate) * up
-        expert_output = _grouped_linear(
-            expert_hidden, self.down_proj, offsets
-        )
-        expert_output = expert_output * sorted_weights.unsqueeze(-1)
-
-        # Restore assignment order directly, avoiding an inverse-permutation
-        # tensor followed by an indexed gather before the top-k reduction.
-        ordered_output = torch.empty_like(expert_output)
-        ordered_output[permutation] = expert_output
-        return ordered_output.view(
-            num_tokens, top_k, self.hidden_dim
-        ).sum(dim=1).to(dtype=hidden_states.dtype)
+        if _use_fused_swiglu(sorted_hidden):
+            expert_hidden = _FusedSwiGLU.apply(
+                sorted_hidden, self.gate_up_proj.to(dtype=sorted_hidden.dtype), offsets
+            )
+            expert_output = _GroupedLinear.apply(
+                expert_hidden, self.down_proj.to(dtype=sorted_hidden.dtype), offsets
+            )
+        else:
+            gate, up = _grouped_linear(
+                sorted_hidden, self.gate_up_proj, offsets
+            ).chunk(2, dim=-1)
+            expert_hidden = F.silu(gate) * up
+            expert_output = _grouped_linear(
+                expert_hidden, self.down_proj, offsets
+            )
+        return _CombineTopK.apply(
+            expert_output, sorted_weights, inverse_permutation,
+            sorted_token_indices, top_k,
+        ).to(dtype=hidden_states.dtype)
 
 
 class SparseMoE(nn.Module):
@@ -570,6 +1094,27 @@ def export_hf(model: ByteLM, out_dir: Path) -> None:
         "model_max_length": cfg.max_position_embeddings,
         "clean_up_tokenization_spaces": False,
     }, indent=2), encoding="utf-8")
+
+
+def enable_triton_gemm_autotune() -> None:
+    """Let inductor benchmark its Triton GEMM templates against cuBLAS per shape.
+
+    Inductor's ``is_big_gpu()`` gate (>= 68 SMs) silently disables Triton GEMM
+    templates on the 48-SM GB10, so ``mode="max-autotune"`` never actually
+    tried them there.  With the gate bypassed and only GEMM autotuning on (the
+    compile mode stays "default": no cudagraphs, no pointwise benchmarking),
+    Triton wins the output-heavy shapes on sm_121 -- gate_up forward 2.02 ms vs
+    cuBLAS 2.70 ms, down-proj addmm 1.24 vs 1.74 ms -- while cuBLAS keeps the
+    K=49152 weight-gradient GEMMs: +4.3% dense / +1.0% MoE throughput at the
+    default shape.  Costs ~25 s of benchmarking on the first (uncached) compile;
+    configs that exceed the 99 KB shared memory are skipped by inductor.
+    """
+    import torch._inductor.config as inductor_config
+    import torch._inductor.utils as inductor_utils
+
+    inductor_utils.is_big_gpu = lambda *args, **kwargs: True
+    inductor_config.max_autotune_gemm = True
+    inductor_config.max_autotune_gemm_backends = "ATEN,TRITON"
 
 
 # --------------------------------------------------------------------------- #
@@ -968,18 +1513,19 @@ def global_load_balancing_loss(
 
     distributed = dist.is_available() and dist.is_initialized()
     world_size = dist.get_world_size() if distributed else 1
-    global_counts = hard_counts.detach().clone()
-    global_soft_sums = soft_sums.detach().clone()
-    global_entropy_sum = entropy_sum.detach().clone()
-    global_valid_rows = valid_rows.detach().clone()
+    # One packed all-reduce instead of four latency-bound ones per step.
+    packed = torch.cat([
+        hard_counts.detach(),
+        soft_sums.detach(),
+        entropy_sum.detach().reshape(1),
+        valid_rows.detach().reshape(1),
+    ])
     if distributed:
-        for tensor in (
-            global_counts,
-            global_soft_sums,
-            global_entropy_sum,
-            global_valid_rows,
-        ):
-            dist.all_reduce(tensor, op=dist.ReduceOp.SUM)
+        dist.all_reduce(packed, op=dist.ReduceOp.SUM)
+    global_counts = packed[:num_experts]
+    global_soft_sums = packed[num_experts:2 * num_experts]
+    global_entropy_sum = packed[2 * num_experts]
+    global_valid_rows = packed[2 * num_experts + 1]
 
     safe_global_rows = global_valid_rows.clamp_min(1.0)
     has_valid_rows = (global_valid_rows > 0).to(dtype=torch.float32)
@@ -1338,6 +1884,12 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--tokens-per-batch", type=int, default=49152,
                    help="window size per rank per step (GB10 memory optimum)")
     p.add_argument("--compile", action=argparse.BooleanOptionalAction, default=True)
+    p.add_argument("--autotune-gemm", action=argparse.BooleanOptionalAction, default=True,
+                   help="benchmark inductor Triton GEMM templates against cuBLAS per "
+                        "shape (see enable_triton_gemm_autotune); +4.3%% dense on GB10")
+    p.add_argument("--fused-swiglu", action=argparse.BooleanOptionalAction, default=True,
+                   help="Triton grouped GEMM with the SwiGLU fused into its epilogue for "
+                        "the dense MLP and the MoE experts (see _FusedSwiGLU)")
     p.add_argument("--seed", type=int, default=0)
     p.add_argument("--data-seed", type=int, default=None, help="default: --seed")
     p.add_argument("--log-every", type=int, default=50)
@@ -1415,6 +1967,8 @@ def main() -> None:
     elif mlp_only_layers:
         raise ValueError("--mlp-only-layers requires --num-experts > 0")
     data_seed = args.data_seed if args.data_seed is not None else args.seed
+    global FUSED_SWIGLU
+    FUSED_SWIGLU = args.fused_swiglu
 
     rank = int(os.environ.get("RANK", "0"))
     world_size = int(os.environ.get("WORLD_SIZE", "1"))
@@ -1542,6 +2096,8 @@ def main() -> None:
             model, device_ids=[0], broadcast_buffers=False,
         )
     if args.compile:
+        if args.autotune_gemm:
+            enable_triton_gemm_autotune()
         model = torch.compile(model, mode="default", dynamic=False)
     optimizer, optimizer_summary = build_optimizer(model, args)
     scheduler = torch.optim.lr_scheduler.LambdaLR(

@@ -98,6 +98,50 @@ class RouterTest(unittest.TestCase):
             torch.testing.assert_close(actual_grad, expected_grad)
 
 
+class GatherTopKTest(unittest.TestCase):
+    def test_gather_backward_matches_autograd_index(self):
+        torch.manual_seed(0)
+        num_tokens, top_k, dim, num_experts = 37, 2, 16, 5
+        selected = torch.randint(0, num_experts, (num_tokens, top_k))
+        _, permutation = torch.sort(selected.reshape(-1))
+        token_index = permutation // top_k
+        inverse = torch.empty_like(permutation)
+        inverse[permutation] = torch.arange(permutation.numel())
+        hidden = torch.randn(num_tokens, dim, requires_grad=True)
+        probe = torch.randn(num_tokens * top_k, dim)
+
+        actual = train._GatherTopK.apply(hidden, token_index, inverse, top_k)
+        expected = hidden[token_index]
+        torch.testing.assert_close(actual, expected)
+        actual_grad, = torch.autograd.grad((actual * probe).sum(), hidden)
+        expected_grad, = torch.autograd.grad((expected * probe).sum(), hidden)
+        torch.testing.assert_close(actual_grad, expected_grad)
+
+
+class CombineTopKTest(unittest.TestCase):
+    def test_combine_matches_scatter_reference(self):
+        torch.manual_seed(0)
+        num_tokens, top_k, dim, num_experts = 37, 2, 16, 5
+        selected = torch.randint(0, num_experts, (num_tokens, top_k))
+        _, permutation = torch.sort(selected.reshape(-1))
+        token_index = permutation // top_k
+        inverse = torch.empty_like(permutation)
+        inverse[permutation] = torch.arange(permutation.numel())
+        rows = torch.randn(num_tokens * top_k, dim, requires_grad=True)
+        weights = torch.rand(num_tokens * top_k, requires_grad=True)
+        probe = torch.randn(num_tokens, dim)
+
+        actual = train._CombineTopK.apply(rows, weights, inverse, token_index, top_k)
+        ordered = torch.empty_like(rows)
+        ordered[permutation] = rows * weights.unsqueeze(-1)
+        expected = ordered.view(num_tokens, top_k, dim).sum(dim=1)
+        torch.testing.assert_close(actual, expected)
+        actual_grads = torch.autograd.grad((actual * probe).sum(), (rows, weights))
+        expected_grads = torch.autograd.grad((expected * probe).sum(), (rows, weights))
+        for a, e in zip(actual_grads, expected_grads):
+            torch.testing.assert_close(a, e)
+
+
 class AuxiliaryLossTest(unittest.TestCase):
     def test_masked_loss_matches_formula_and_ignores_filler(self):
         logits = torch.tensor([
@@ -314,6 +358,73 @@ class CudaGroupedMMTest(unittest.TestCase):
         torch.testing.assert_close(
             actual_grad, expected_grad, rtol=0.0, atol=0.0
         )
+
+    def test_fused_swiglu_matches_unfused_dense_and_grouped(self):
+        if train.triton is None:
+            self.skipTest("triton is required")
+        torch.manual_seed(0)
+        rows, dim, inter = 1000, 128, 192
+        x = torch.randn(rows, dim, device="cuda", dtype=torch.bfloat16, requires_grad=True)
+        probe = torch.randn(rows, inter, device="cuda", dtype=torch.bfloat16)
+
+        def unfused(x_, w_, offs_):
+            parts, start = [], 0
+            for e in range(w_.shape[0]):
+                end = int(offs_[e])
+                gate, up = (x_[start:end] @ w_[e].t()).chunk(2, dim=-1)
+                parts.append(F.silu(gate) * up)
+                start = end
+            return torch.cat(parts)
+
+        def check(w, offs):
+            # fp32 reference; both bf16 paths must sit within bf16 noise of it,
+            # and the fused path must not be measurably worse than the unfused one
+            x32 = x.detach().float().requires_grad_(True)
+            w32 = w.detach().float().requires_grad_(True)
+            ref = unfused(x32, w32, offs)
+            rx, rw = torch.autograd.grad((ref * probe.float()).sum(), (x32, w32))
+            fused_h = train._FusedSwiGLU.apply(x, w, offs)
+            fx, fw = torch.autograd.grad((fused_h * probe).sum(), (x, w))
+            unfused_h = unfused(x, w, offs)
+            ux, uw = torch.autograd.grad((unfused_h * probe).sum(), (x, w))
+            for name, f, u, r in (("h", fused_h, unfused_h, ref), ("dx", fx, ux, rx), ("dw", fw, uw, rw)):
+                err_f = (f.float() - r).abs().max().item()
+                err_u = (u.float() - r).abs().max().item()
+                scale = r.abs().max().item()
+                self.assertLess(err_f, 0.05 * scale + 1e-3, f"{name}: fused err {err_f} (scale {scale})")
+                self.assertLess(err_f, 1.5 * err_u + 0.01 * scale + 1e-3,
+                                f"{name}: fused err {err_f} vs unfused {err_u}")
+            return fw
+
+        w = (torch.randn(1, 2 * inter, dim, device="cuda") * 0.05).to(torch.bfloat16).requires_grad_(True)
+        check(w, torch.tensor([rows], device="cuda", dtype=torch.int32))
+        counts = torch.tensor([300, 0, 700], device="cuda")
+        w3 = (torch.randn(3, 2 * inter, dim, device="cuda") * 0.05).to(torch.bfloat16).requires_grad_(True)
+        gw3 = check(w3, torch.cumsum(counts, 0).to(torch.int32))
+        torch.testing.assert_close(gw3[1], torch.zeros_like(gw3[1]))
+
+    def test_grouped_linear_matches_per_expert_reference(self):
+        if train.triton is None:
+            self.skipTest("triton is required")
+        torch.manual_seed(1)
+        rows, inter, dim = 1000, 192, 128
+        h = torch.randn(rows, inter, device="cuda", dtype=torch.bfloat16, requires_grad=True)
+        w = (torch.randn(3, dim, inter, device="cuda") * 0.05).to(torch.bfloat16).requires_grad_(True)
+        offs = torch.cumsum(torch.tensor([300, 0, 700], device="cuda"), 0).to(torch.int32)
+        out = train._GroupedLinear.apply(h, w, offs)
+        parts, start = [], 0
+        for e in range(3):
+            end = int(offs[e])
+            parts.append(h[start:end] @ w[e].t())
+            start = end
+        expected = torch.cat(parts)
+        torch.testing.assert_close(out, expected, rtol=2e-2, atol=2e-2)  # bf16: K-chunk order differs
+        probe = torch.randn_like(out)
+        gh, gw = torch.autograd.grad((out * probe).sum(), (h, w))
+        eh, ew = torch.autograd.grad((expected * probe).sum(), (h, w))
+        torch.testing.assert_close(gh, eh, rtol=2e-2, atol=2e-2)
+        torch.testing.assert_close(gw, ew, rtol=2e-2, atol=2e-2)
+        torch.testing.assert_close(gw[1], torch.zeros_like(gw[1]))
 
     def test_unused_experts_have_zero_finite_gradients(self):
         config = tiny_config(hidden_size=128, num_hidden_layers=1,
