@@ -1323,6 +1323,15 @@ def main() -> None:
     training_real_tokens = sum(
         train_batches[w].real_tokens for w in executed_global_order if w >= 0
     )
+    # Every rank knows the whole schedule, so the global real-token count of
+    # each DDP step is a host-side constant: no per-step all_reduce, and no
+    # device sync before the optimizer can be launched.
+    step_global_tokens = [
+        sum(train_batches[w].real_tokens
+            for w in global_batch_order[i * world_size:(i + 1) * world_size]
+            if w >= 0)
+        for i in range(steps_total)
+    ]
     training_compute_tokens = steps_total * world_size * window
     packing_utilization = training_real_tokens / training_compute_tokens
     lr_schedule_steps, warmup_steps, val_interval = resolve_training_schedule(
@@ -1469,7 +1478,7 @@ def main() -> None:
         torch._dynamo.mark_dynamic(cu_t, 0)  # varying segment count (compile trap)
         return ids, tgt, pos_t, cu_t, packed.real_tokens
 
-    def forward_backward(w: int):
+    def forward_backward(w: int, global_tokens: int):
         ids, tgt, pos_t, cu_t, real_tokens = batch_for(w)
         with torch.amp.autocast(device_type="cuda", dtype=torch.bfloat16):
             model_output = model(
@@ -1489,10 +1498,7 @@ def main() -> None:
         # Packed batches contain different numbers of real targets. DDP averages
         # gradients across ranks, so compensate by world_size/global_tokens to
         # make the result exactly the global token-mean gradient.
-        global_tokens_t = torch.tensor(real_tokens, device=device, dtype=torch.int64)
-        if distributed:
-            dist.all_reduce(global_tokens_t, op=dist.ReduceOp.SUM)
-        scaled_loss = loss_sum * world_size / global_tokens_t.to(loss_sum.dtype)
+        scaled_loss = loss_sum * (world_size / global_tokens)
         router_stats = None
         if config.num_experts > 0:
             router_aux_loss, router_stats = global_load_balancing_loss(
@@ -1504,12 +1510,7 @@ def main() -> None:
             )
             scaled_loss = scaled_loss + config.router_aux_loss_coef * router_aux_loss
         scaled_loss.backward()
-        return (
-            loss_sum.detach(),
-            real_tokens,
-            int(global_tokens_t.item()),
-            router_stats,
-        )
+        return loss_sum.detach(), real_tokens, global_tokens, router_stats
 
     # Val windows live on the GPU for the whole run (~1.2 MB each).  Validation
     # is rank 0 only and MUST bypass the DDP wrapper: otherwise its forward-time
@@ -1606,7 +1607,7 @@ def main() -> None:
     if remaining:
         prewarm_start = time.perf_counter()
         warm_loss_sum, _, warm_global_tokens, warm_router_stats = forward_backward(
-            remaining[0]
+            remaining[0], step_global_tokens[start_step]
         )
         if distributed:
             dist.all_reduce(warm_loss_sum, op=dist.ReduceOp.SUM)
@@ -1652,7 +1653,9 @@ def main() -> None:
 
     for step, w in enumerate(remaining, start=start_step + 1):
         optimizer.zero_grad(set_to_none=True)
-        loss_sum, local_step_tokens, global_step_tokens, router_stats = forward_backward(w)
+        loss_sum, local_step_tokens, global_step_tokens, router_stats = forward_backward(
+            w, step_global_tokens[step - 1]
+        )
         last_router_stats = router_stats
         optimizer.step()
         scheduler.step()
