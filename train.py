@@ -643,6 +643,45 @@ if triton is not None:
         tl.store(out_ptrs, acc.to(Out.dtype.element_ty))
 
 
+if triton is not None:
+
+    @triton.jit
+    def _momentum_stage_kernel(G, V, U, n, w_v, w_u, BLOCK: tl.constexpr):
+        """v <- lerp(v, g, w_v) in place (fp32); u <- lerp(g, v_new, w_u)
+        stored in U's dtype. Uses torch.lerp's weight<0.5 formula for the
+        first and its weight>=0.5 formula for the second, so the results are
+        bit-identical to the two-pass torch version for momentum >= 0.5."""
+        pid = tl.program_id(0)
+        offs = pid * BLOCK + tl.arange(0, BLOCK)
+        mask = offs < n
+        g = tl.load(G + offs, mask=mask, other=0.0)
+        v = tl.load(V + offs, mask=mask, other=0.0)
+        v_new = v + w_v * (g - v)
+        u = v_new - (v_new - g) * (1.0 - w_u)
+        tl.store(V + offs, v_new, mask=mask)
+        tl.store(U + offs, u.to(U.dtype.element_ty), mask=mask)
+
+
+def _momentum_stage_supported(g, v, u, momentum: float) -> bool:
+    return (
+        triton is not None and g.is_cuda
+        and g.is_contiguous() and v.is_contiguous() and u.is_contiguous()
+        and g.dtype == torch.float32 and v.dtype == torch.float32
+        and 1.0 - momentum < 0.5 <= momentum
+    )
+
+
+def _momentum_stage(g, v, u, momentum: float) -> None:
+    """One fused pass: momentum buffer update + Nesterov update staged as
+    bf16. Saves re-reading g and v (the step is bandwidth bound on GB10)."""
+    n = g.numel()
+    grid = (triton.cdiv(n, 4096),)
+    _momentum_stage_kernel[grid](
+        g.view(-1), v.view(-1), u.view(-1), n, 1.0 - momentum, momentum,
+        BLOCK=4096, num_warps=8,
+    )
+
+
 def _bmm_epilogue_supported(rows: int, cols: int) -> bool:
     """The Triton path needs tiles that divide the (rows <= cols) NS operands.
     Every product in the iteration is (rows x rows) @ (rows x cols) or the
@@ -748,10 +787,6 @@ class MuonAdamWHybrid(torch.optim.Optimizer):
             if "v" not in state:
                 state["v"] = torch.zeros_like(p, dtype=torch.float32)
             vs.append(state["v"])
-        # lerp evaluates the momentum recurrence in one multi-tensor pass
-        # instead of a multiply pass followed by an add pass.
-        torch._foreach_lerp_(vs, grads, 1 - momentum)
-
         by_shape: dict[tuple[int, int, int], list] = {}
         for p, g, v in zip(params, grads, vs):
             if p.ndim not in (2, 3):
@@ -768,16 +803,21 @@ class MuonAdamWHybrid(torch.optim.Optimizer):
                 if ndim == 2:
                     g, v = g.unsqueeze(0), v.unsqueeze(0)
                 staged = stacked[offset : offset + batch_size]
-                # The Nesterov update lerp(g, v, momentum) is written straight
-                # into the bf16 Newton-Schulz staging stack (fp32 math, one
-                # rounding): one read of g and v and one half-size write,
-                # instead of a second full fp32 lerp pass over the gradients
-                # followed by a cast copy. The optimizer step is bandwidth
-                # bound on GB10, so these passes are most of its non-GEMM time.
-                if group["nesterov"]:
-                    torch.lerp(g, v, momentum, out=staged)
+                # Momentum update v <- lerp(v, g, 1-m) and the Nesterov update
+                # lerp(g, v, m) written straight into the bf16 Newton-Schulz
+                # staging stack (fp32 math, one rounding). On CUDA both happen
+                # in one fused Triton pass: one read of g and v, one fp32 and
+                # one bf16 write. The optimizer step is bandwidth bound on
+                # GB10, so these passes are most of its non-GEMM time. The
+                # torch path below is bit-identical and serves CPU/edge cases.
+                if group["nesterov"] and _momentum_stage_supported(g, v, staged, momentum):
+                    _momentum_stage(g, v, staged, momentum)
                 else:
-                    staged.copy_(v)
+                    v.lerp_(g, 1 - momentum)
+                    if group["nesterov"]:
+                        torch.lerp(g, v, momentum, out=staged)
+                    else:
+                        staged.copy_(v)
                 offset += batch_size
             ortho = _newtonschulz5_batched(stacked, steps=group["ns_steps"])
             # aspect-ratio factor; also what makes Muon lr width-invariant
