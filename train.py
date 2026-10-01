@@ -449,9 +449,12 @@ FP8_HEADROOM_BINADES = 1
 
 
 def _use_fp8_mlp(block, h: torch.Tensor) -> bool:
+    d, inter = h.shape[1], block.mlp.down_proj.weight.shape[1]
+    # the norm kernels tile a whole row (power-of-two hidden size); the GEMM grids
+    # assume 128-divisible hidden and intermediate sizes
     return (FP8_MLP and block.training and not block.is_sparse and triton is not None
             and h.is_cuda and h.dtype == torch.bfloat16
-            and h.shape[1] % 128 == 0 and block.mlp.down_proj.weight.shape[1] % 128 == 0)
+            and d % 128 == 0 and d & (d - 1) == 0 and inter % 128 == 0)
 
 
 @torch.no_grad()
