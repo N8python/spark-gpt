@@ -234,6 +234,9 @@ class MLP(nn.Module):
         super().__init__()
         self.gate_up_proj = nn.Linear(dim, 2 * hidden_dim, bias=False)
         self.down_proj = nn.Linear(hidden_dim, dim, bias=False)
+        # fp8 MLP state (see _FP8MLPBlock); per-rank, not checkpointed
+        self.register_buffer("fp8_scale", torch.ones(5), persistent=False)
+        self.register_buffer("fp8_amax", torch.zeros(5), persistent=False)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         if _use_fused_swiglu(x):
@@ -427,6 +430,345 @@ class _QKNormRoPEAttention(torch.autograd.Function):
         )
         dw = dw.sum(0)
         return (dqkv, dw[0], dw[1], None, None, None, None, None, None, None, None)
+
+
+# --------------------------------------------------------------------------- #
+# fp8 MLP sub-block (Triton): RMSNorm -> SwiGLU MLP -> residual, fp8 storage
+# --------------------------------------------------------------------------- #
+FP8_MLP = False  # --fp8-mlp: dense MLP sub-blocks keep activations/grads in fp8 while training
+
+# Per-layer fp8 state (MLP buffers fp8_scale / fp8_amax, one slot per tensor):
+#   0 = x (normed MLP input, e4m3), 1 = gu (gate/up pre-activation, e4m3),
+#   2 = h (SwiGLU output, e4m3),    3 = d_gu (its gradient, e5m2),
+#   4 = dy (gradient of the sub-block output, e5m2; quantized in registers).
+# Scales are delayed: each step quantizes with powers of two derived from the
+# previous step's amax (one binade of headroom); the kernels record this step's
+# amax of the UNquantized values with atomic max. fp8_update_scales() rolls them.
+FP8_SITE_MAX = (448.0, 448.0, 448.0, 57344.0, 57344.0)
+FP8_HEADROOM_BINADES = 1
+
+
+def _use_fp8_mlp(block, h: torch.Tensor) -> bool:
+    return (FP8_MLP and block.training and not block.is_sparse and triton is not None
+            and h.is_cuda and h.dtype == torch.bfloat16
+            and h.shape[1] % 128 == 0 and block.mlp.down_proj.weight.shape[1] % 128 == 0)
+
+
+@torch.no_grad()
+def fp8_update_scales(model: nn.Module) -> None:
+    """Roll every MLP's recorded amax into next step's quantization scales."""
+    for m in model.modules():
+        if isinstance(m, MLP):
+            fmax = m.fp8_scale.new_tensor(FP8_SITE_MAX)
+            new = torch.exp2(torch.floor(torch.log2(fmax / m.fp8_amax.clamp(min=1e-30)))
+                             - FP8_HEADROOM_BINADES)
+            m.fp8_scale.copy_(torch.where(m.fp8_amax > 0, new, m.fp8_scale))
+            m.fp8_amax.zero_()
+
+
+def _fp8_quantize_weight(w: torch.Tensor):
+    """Per-tensor e4m3 copy of an fp32 master weight (just-in-time pow2 scale)."""
+    q = torch.exp2(torch.floor(torch.log2(448.0 / w.detach().abs().amax().clamp(min=1e-30))))
+    return (w.detach() * q).clamp(-448.0, 448.0).to(torch.float8_e4m3fn), q
+
+
+@triton.jit
+def _fp8_norm_quant_kernel(H, NW, X8, X8T, RSTD, SC, AMAX, T,
+                           EPS: tl.constexpr, D: tl.constexpr, BLOCK_T: tl.constexpr):
+    """x8 = e4m3(rmsnorm(h) * w * scale_x), written row-major for the forward GEMM and
+    transposed (token-contiguous) for the weight gradient, whose fp8 MMA wants its
+    reduction dim contiguous; rstd kept for the backward."""
+    rt = tl.program_id(0) * BLOCK_T + tl.arange(0, BLOCK_T)
+    rd = tl.arange(0, D)
+    m = (rt < T)[:, None]
+    h = tl.load(H + rt[:, None] * D + rd[None, :], mask=m, other=0.0).to(tl.float32)
+    rstd = tl.rsqrt(tl.sum(h * h, 1) / D + EPS)
+    n = h * rstd[:, None] * tl.load(NW + rd)[None, :]
+    q = tl.load(SC)
+    x8 = tl.clamp(n * q, -448.0, 448.0).to(tl.float8e4nv)
+    tl.store(X8 + rt[:, None] * D + rd[None, :], x8, mask=m)
+    tl.store(X8T + rd[None, :] * T + rt[:, None], x8, mask=m)
+    tl.store(RSTD + rt, rstd, mask=rt < T)
+    tl.atomic_max(AMAX, tl.max(tl.abs(n)))
+
+
+@triton.jit
+def _fp8_swiglu_fwd_kernel(X8, W8, SC, WS, GU8, H8, AMAX, T, K, I,
+                           BLOCK_M: tl.constexpr, BLOCK_N: tl.constexpr, BLOCK_K: tl.constexpr,
+                           GROUP_M: tl.constexpr):
+    """gu = x8 @ W8^T (fp8 MMA, fp32 acc); g, u rounded to bf16 as in the bf16 path;
+    h = silu(g) * u; gu and h stored e4m3."""
+    pid = tl.program_id(0)
+    num_m = tl.cdiv(T, BLOCK_M)
+    num_n = tl.cdiv(I, BLOCK_N)
+    group = GROUP_M * num_n
+    first_m = (pid // group) * GROUP_M
+    gsz = tl.minimum(num_m - first_m, GROUP_M)
+    m_tile = first_m + (pid % group) % gsz
+    n_tile = (pid % group) // gsz
+    rm = m_tile * BLOCK_M + tl.arange(0, BLOCK_M)
+    rn = n_tile * BLOCK_N + tl.arange(0, BLOCK_N)
+    rk = tl.arange(0, BLOCK_K)
+    m = (rm < T)[:, None]
+    x_ptrs = X8 + rm[:, None] * K + rk[None, :]
+    wg_ptrs = W8 + rn[None, :] * K + rk[:, None]
+    wu_ptrs = wg_ptrs + I * K
+    acc_g = tl.zeros((BLOCK_M, BLOCK_N), dtype=tl.float32)
+    acc_u = tl.zeros((BLOCK_M, BLOCK_N), dtype=tl.float32)
+    for _ in range(0, K, BLOCK_K):
+        x = tl.load(x_ptrs, mask=m, other=0.0)
+        acc_g = tl.dot(x, tl.load(wg_ptrs), acc_g)
+        acc_u = tl.dot(x, tl.load(wu_ptrs), acc_u)
+        x_ptrs += BLOCK_K
+        wg_ptrs += BLOCK_K
+        wu_ptrs += BLOCK_K
+    deq = 1.0 / (tl.load(SC) * tl.load(WS))
+    g = (acc_g * deq).to(tl.bfloat16).to(tl.float32)
+    u = (acc_u * deq).to(tl.bfloat16).to(tl.float32)
+    h = g * tl.sigmoid(g) * u
+    q_gu = tl.load(SC + 1)
+    q_h = tl.load(SC + 2)
+    gu_ptrs = GU8 + rm[:, None] * (2 * I) + rn[None, :]
+    tl.store(gu_ptrs, tl.clamp(g * q_gu, -448.0, 448.0).to(tl.float8e4nv), mask=m)
+    tl.store(gu_ptrs + I, tl.clamp(u * q_gu, -448.0, 448.0).to(tl.float8e4nv), mask=m)
+    tl.store(H8 + rm[:, None] * I + rn[None, :], tl.clamp(h * q_h, -448.0, 448.0).to(tl.float8e4nv), mask=m)
+    tl.atomic_max(AMAX + 1, tl.maximum(tl.max(tl.abs(g)), tl.max(tl.abs(u))))
+    tl.atomic_max(AMAX + 2, tl.max(tl.abs(h)))
+
+
+@triton.jit
+def _fp8_down_fwd_kernel(H8, WD8, RES, Y, SC, WS, T, N, K,
+                         BLOCK_M: tl.constexpr, BLOCK_N: tl.constexpr, BLOCK_K: tl.constexpr,
+                         GROUP_M: tl.constexpr):
+    """y = res + h8 @ Wd8^T (fp8 MMA), residual add fused into the epilogue."""
+    pid = tl.program_id(0)
+    num_m = tl.cdiv(T, BLOCK_M)
+    num_n = tl.cdiv(N, BLOCK_N)
+    group = GROUP_M * num_n
+    first_m = (pid // group) * GROUP_M
+    gsz = tl.minimum(num_m - first_m, GROUP_M)
+    m_tile = first_m + (pid % group) % gsz
+    n_tile = (pid % group) // gsz
+    rm = m_tile * BLOCK_M + tl.arange(0, BLOCK_M)
+    rn = n_tile * BLOCK_N + tl.arange(0, BLOCK_N)
+    rk = tl.arange(0, BLOCK_K)
+    m = (rm < T)[:, None]
+    a_ptrs = H8 + rm[:, None] * K + rk[None, :]
+    b_ptrs = WD8 + rn[None, :] * K + rk[:, None]
+    acc = tl.zeros((BLOCK_M, BLOCK_N), dtype=tl.float32)
+    for _ in range(0, K, BLOCK_K):
+        acc = tl.dot(tl.load(a_ptrs, mask=m, other=0.0), tl.load(b_ptrs), acc)
+        a_ptrs += BLOCK_K
+        b_ptrs += BLOCK_K
+    out = (acc / (tl.load(SC + 2) * tl.load(WS + 1))).to(tl.bfloat16).to(tl.float32)
+    off = rm[:, None] * N + rn[None, :]
+    res = tl.load(RES + off, mask=m, other=0.0).to(tl.float32)
+    tl.store(Y + off, (res + out).to(tl.bfloat16), mask=m)
+
+
+@triton.jit
+def _fp8_down_dgrad_swiglu_kernel(DY, WD, GU8, DGU8, SC, AMAX, T, K, I,
+                                  BLOCK_M: tl.constexpr, BLOCK_N: tl.constexpr,
+                                  BLOCK_K: tl.constexpr, GROUP_M: tl.constexpr):
+    """dh = dy @ Wd (bf16 MMA: at K = d an in-register e5m2 cast of dy costs more than
+    the fp8 MMA saves; dh is never stored); the SwiGLU backward runs in the epilogue
+    against the fp8 gu and writes d_gu once, in e5m2. Also records dy's amax for the
+    fp8 down-proj weight gradient."""
+    pid = tl.program_id(0)
+    num_m = tl.cdiv(T, BLOCK_M)
+    num_n = tl.cdiv(I, BLOCK_N)
+    group = GROUP_M * num_n
+    first_m = (pid // group) * GROUP_M
+    gsz = tl.minimum(num_m - first_m, GROUP_M)
+    m_tile = first_m + (pid % group) % gsz
+    n_tile = (pid % group) // gsz
+    rm = m_tile * BLOCK_M + tl.arange(0, BLOCK_M)
+    rn = n_tile * BLOCK_N + tl.arange(0, BLOCK_N)
+    rk = tl.arange(0, BLOCK_K)
+    m = (rm < T)[:, None]
+    a_ptrs = DY + rm[:, None] * K + rk[None, :]
+    b_ptrs = WD + rk[:, None] * I + rn[None, :]
+    acc = tl.zeros((BLOCK_M, BLOCK_N), dtype=tl.float32)
+    dy_amax = 0.0
+    for _ in range(0, K, BLOCK_K):
+        dy = tl.load(a_ptrs, mask=m, other=0.0)
+        dy_amax = tl.maximum(dy_amax, tl.max(tl.abs(dy.to(tl.float32))))
+        acc = tl.dot(dy, tl.load(b_ptrs), acc)
+        a_ptrs += BLOCK_K
+        b_ptrs += BLOCK_K * I
+    tl.atomic_max(AMAX + 4, dy_amax)
+    dh = acc.to(tl.bfloat16).to(tl.float32)
+    s_gu = 1.0 / tl.load(SC + 1)
+    q = tl.load(SC + 3)
+    gu_ptrs = GU8 + rm[:, None] * (2 * I) + rn[None, :]
+    g = tl.load(gu_ptrs, mask=m, other=0.0).to(tl.float32) * s_gu
+    u = tl.load(gu_ptrs + I, mask=m, other=0.0).to(tl.float32) * s_gu
+    sig = tl.sigmoid(g)
+    d_gate = dh * u * (sig * (1.0 + g * (1.0 - sig)))
+    d_up = dh * g * sig
+    out_ptrs = DGU8 + rm[:, None] * (2 * I) + rn[None, :]
+    tl.store(out_ptrs, tl.clamp(d_gate * q, -57344.0, 57344.0).to(tl.float8e5), mask=m)
+    tl.store(out_ptrs + I, tl.clamp(d_up * q, -57344.0, 57344.0).to(tl.float8e5), mask=m)
+    tl.atomic_max(AMAX + 3, tl.maximum(tl.max(tl.abs(d_gate)), tl.max(tl.abs(d_up))))
+
+
+@triton.jit
+def _fp8_mm_kernel(A, B, OUT, SA, SB, M, N, K, stride_am, stride_ak, stride_bk, stride_bn,
+                   BLOCK_M: tl.constexpr, BLOCK_N: tl.constexpr, BLOCK_K: tl.constexpr,
+                   GROUP_M: tl.constexpr):
+    """OUT = (A @ B) / (SA * SB): fp8 operands at arbitrary strides, quantization scales
+    SA/SB undone in the epilogue (gate_up dgrad d_gu @ W, and wgrad d_gu^T @ x with A
+    read transposed)."""
+    pid = tl.program_id(0)
+    num_m = tl.cdiv(M, BLOCK_M)
+    num_n = tl.cdiv(N, BLOCK_N)
+    group = GROUP_M * num_n
+    first_m = (pid // group) * GROUP_M
+    gsz = tl.minimum(num_m - first_m, GROUP_M)
+    m_tile = first_m + (pid % group) % gsz
+    n_tile = (pid % group) // gsz
+    rm = m_tile * BLOCK_M + tl.arange(0, BLOCK_M)
+    rn = n_tile * BLOCK_N + tl.arange(0, BLOCK_N)
+    rk = tl.arange(0, BLOCK_K)
+    a_ptrs = A + rm[:, None] * stride_am + rk[None, :] * stride_ak
+    b_ptrs = B + rk[:, None] * stride_bk + rn[None, :] * stride_bn
+    acc = tl.zeros((BLOCK_M, BLOCK_N), dtype=tl.float32)
+    for k0 in range(0, K, BLOCK_K):
+        k_mask = (k0 + rk) < K
+        a = tl.load(a_ptrs, mask=(rm < M)[:, None] & k_mask[None, :], other=0.0)
+        b = tl.load(b_ptrs, mask=k_mask[:, None], other=0.0)
+        acc = tl.dot(a, b, acc)
+        a_ptrs += BLOCK_K * stride_ak
+        b_ptrs += BLOCK_K * stride_bk
+    deq = 1.0 / (tl.load(SA) * tl.load(SB))
+    tl.store(OUT + rm[:, None] * N + rn[None, :], (acc * deq).to(OUT.dtype.element_ty),
+             mask=(rm < M)[:, None])
+
+
+@triton.jit
+def _fp8_norm_bwd_kernel(H, RSTD, DXN, DY, NW, DH, DNW, T,
+                         D: tl.constexpr, BLOCK_T: tl.constexpr):
+    """dh = dy + rmsnorm backward of dxn; per-program partial norm-weight grads."""
+    pid = tl.program_id(0)
+    rt = pid * BLOCK_T + tl.arange(0, BLOCK_T)
+    rd = tl.arange(0, D)
+    m = (rt < T)[:, None]
+    off = rt[:, None] * D + rd[None, :]
+    h = tl.load(H + off, mask=m, other=0.0).to(tl.float32)
+    r = tl.load(RSTD + rt, mask=rt < T, other=0.0)
+    g = tl.load(DXN + off, mask=m, other=0.0).to(tl.float32)
+    gw = g * tl.load(NW + rd)[None, :]
+    s = tl.sum(gw * h, 1)
+    dh = gw * r[:, None] - h * (s * r * r * r * (1.0 / D))[:, None]
+    dh += tl.load(DY + off, mask=m, other=0.0).to(tl.float32)
+    tl.store(DH + off, dh.to(tl.bfloat16), mask=m)
+    tl.store(DNW + pid * D + rd, tl.sum(g * (h * r[:, None]), 0))
+
+
+@triton.jit
+def _fp8_wgrad_kernel(A, B, OUT, SA, SB, T, MA, NB, ROWS_PER_SPLIT,
+                      A_BF16: tl.constexpr, BLOCK_R: tl.constexpr, BLOCK_M: tl.constexpr,
+                      BLOCK_N: tl.constexpr):
+    """OUT[split, m, n] = sum_{t in split} A[t, m] B[t, n] / (SA * SB): weight gradients
+    reduced over tokens. Row tiles are loaded contiguously and transposed in registers;
+    a bf16 A (dy) is quantized to e5m2 in registers with scale SA. Splits over tokens are
+    summed by the caller (deterministic)."""
+    pid = tl.program_id(0)
+    split = tl.program_id(1)
+    num_n = tl.cdiv(NB, BLOCK_N)
+    rm = (pid // num_n) * BLOCK_M + tl.arange(0, BLOCK_M)
+    rn = (pid % num_n) * BLOCK_N + tl.arange(0, BLOCK_N)
+    rr = tl.arange(0, BLOCK_R)
+    qa = tl.load(SA)
+    acc = tl.zeros((BLOCK_M, BLOCK_N), dtype=tl.float32)
+    r_end = tl.minimum((split + 1) * ROWS_PER_SPLIT, T)
+    for r0 in range(split * ROWS_PER_SPLIT, r_end, BLOCK_R):
+        rows = r0 + rr
+        rmask = (rows < r_end)[:, None]
+        a = tl.load(A + rows[:, None] * MA + rm[None, :], mask=rmask, other=0.0)
+        if A_BF16:
+            a = tl.clamp(a.to(tl.float32) * qa, -57344.0, 57344.0).to(tl.float8e5)
+        b = tl.load(B + rows[:, None] * NB + rn[None, :], mask=rmask, other=0.0)
+        acc = tl.dot(tl.trans(a), b, acc)
+    tl.store(OUT + split * MA * NB + rm[:, None] * NB + rn[None, :], acc / (qa * tl.load(SB)))
+
+
+def _fp8_wgrad(a, b, sa, sb, a_bf16, *, BLOCK_R=64, BLOCK_M=128, BLOCK_N=128, splits=2,
+               num_warps=4, num_stages=3):
+    T_, MA = a.shape
+    NB = b.shape[1]
+    rows = triton.cdiv(triton.cdiv(T_, splits), BLOCK_R) * BLOCK_R
+    out = torch.empty(splits, MA, NB, device=a.device, dtype=torch.float32)
+    _fp8_wgrad_kernel[((MA // BLOCK_M) * (NB // BLOCK_N), splits)](
+        a, b, out, sa, sb, T_, MA, NB, rows, A_BF16=a_bf16,
+        BLOCK_R=BLOCK_R, BLOCK_M=BLOCK_M, BLOCK_N=BLOCK_N, num_warps=num_warps, num_stages=num_stages)
+    return out.sum(0) if splits > 1 else out[0]
+
+
+FP8_NORM_BLOCK_T = 16
+
+
+class _FP8MLPBlock(torch.autograd.Function):
+    """y = h + down(SwiGLU(gate_up(rmsnorm(h)))) with every large MLP activation and
+    activation gradient stored in fp8 (x, gu, h: e4m3; d_gu: e5m2) and fp8 MMAs for
+    every GEMM but the down-proj dgrad (bf16 dy; the down-proj wgrad quantizes dy to
+    e5m2 in registers). Master weights stay fp32 (quantized per call); weight and
+    norm-weight grads are fp32."""
+
+    @staticmethod
+    def forward(ctx, h, norm_w, w_gu, w_down, scale, amax, eps):
+        T_, D = h.shape
+        I = w_down.shape[1]
+        dev = h.device
+        x8 = torch.empty(T_, D, device=dev, dtype=torch.float8_e4m3fn)
+        x8t = torch.empty(D, T_, device=dev, dtype=torch.float8_e4m3fn)
+        rstd = torch.empty(T_, device=dev, dtype=torch.float32)
+        _fp8_norm_quant_kernel[(triton.cdiv(T_, 32),)](
+            h, norm_w, x8, x8t, rstd, scale, amax, T_, EPS=eps, D=D, BLOCK_T=32,
+            num_warps=8)
+        w8, q_gu = _fp8_quantize_weight(w_gu)
+        wd8, q_d = _fp8_quantize_weight(w_down)
+        wscale = torch.stack((q_gu, q_d)).float()
+        gu8 = torch.empty(T_, 2 * I, device=dev, dtype=torch.float8_e4m3fn)
+        h8 = torch.empty(T_, I, device=dev, dtype=torch.float8_e4m3fn)
+        _fp8_swiglu_fwd_kernel[(triton.cdiv(T_, 128) * (I // 64),)](
+            x8, w8, scale, wscale, gu8, h8, amax, T_, D, I,
+            BLOCK_M=128, BLOCK_N=64, BLOCK_K=64, GROUP_M=8, num_warps=4, num_stages=4)
+        y = torch.empty_like(h)
+        _fp8_down_fwd_kernel[(triton.cdiv(T_, 128) * (D // 64),)](
+            h8, wd8, h, y, scale, wscale, T_, D, I,
+            BLOCK_M=128, BLOCK_N=64, BLOCK_K=128, GROUP_M=8, num_warps=4, num_stages=3)
+        # fp8 MMA wants K-contiguous operands: the dgrad's B is W8^T (tiny, copied here)
+        ctx.save_for_backward(h, norm_w, w_down.to(torch.bfloat16), x8t, rstd,
+                              w8.t().contiguous(), wscale, gu8, h8, scale, amax)
+        return y
+
+    @staticmethod
+    def backward(ctx, dy):
+        h, norm_w, wd, x8t, rstd, w8t, wscale, gu8, h8, scale, amax = ctx.saved_tensors
+        dy = dy.contiguous()
+        T_, D = h.shape
+        I = wd.shape[1]
+        dev = h.device
+        dgu8 = torch.empty(T_, 2 * I, device=dev, dtype=torch.float8_e5m2)
+        _fp8_down_dgrad_swiglu_kernel[(triton.cdiv(T_, 64) * (I // 128),)](
+            dy, wd, gu8, dgu8, scale, amax, T_, D, I,
+            BLOCK_M=64, BLOCK_N=128, BLOCK_K=32, GROUP_M=8, num_warps=8, num_stages=4)
+        dxn = torch.empty(T_, D, device=dev, dtype=torch.bfloat16)
+        _fp8_mm_kernel[(triton.cdiv(T_, 128) * (D // 128),)](
+            dgu8, w8t, dxn, scale[3:], wscale[0:], T_, D, 2 * I, 2 * I, 1, 1, 2 * I,
+            BLOCK_M=128, BLOCK_N=128, BLOCK_K=64, GROUP_M=8, num_warps=4, num_stages=3)
+        dh = torch.empty_like(h)
+        n_prog = triton.cdiv(T_, FP8_NORM_BLOCK_T)
+        dnw = torch.empty(n_prog, D, device=dev, dtype=torch.float32)
+        _fp8_norm_bwd_kernel[(n_prog,)](
+            h, rstd, dxn, dy, norm_w, dh, dnw, T_, D=D, BLOCK_T=FP8_NORM_BLOCK_T, num_warps=4)
+        dwd = _fp8_wgrad(dy, h8, scale[4:], scale[2:], True, BLOCK_R=32)
+        dwgu = torch.empty(2 * I, D, device=dev, dtype=torch.float32)
+        _fp8_mm_kernel[((2 * I) // 128 * (D // 128),)](  # d_gu^T @ x8, A read transposed
+            dgu8, x8t, dwgu, scale[3:], scale[0:], 2 * I, D, T_, 1, 2 * I, 1, T_,
+            BLOCK_M=128, BLOCK_N=128, BLOCK_K=64, GROUP_M=8, num_warps=4, num_stages=3)
+        return dh, dnw.sum(0), dwgu, dwd, None, None, None
 
 
 # --------------------------------------------------------------------------- #
@@ -1092,6 +1434,13 @@ class Block(nn.Module):
 
     def forward(self, x, rope, cu_seqlens, max_seqlen):
         h = x + self.self_attn(self.input_layernorm(x), rope, cu_seqlens, max_seqlen)
+        if _use_fp8_mlp(self, h):
+            y = _FP8MLPBlock.apply(
+                h, self.post_attention_layernorm.weight, self.mlp.gate_up_proj.weight,
+                self.mlp.down_proj.weight, self.mlp.fp8_scale, self.mlp.fp8_amax,
+                self.post_attention_layernorm.eps,
+            )
+            return y, None, None
         mlp_input = self.post_attention_layernorm(h)
         if self.is_sparse:
             mlp_output, router_logits, selected_experts = self.mlp(mlp_input)
@@ -2097,6 +2446,10 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--fused-swiglu", action=argparse.BooleanOptionalAction, default=True,
                    help="Triton grouped GEMM with the SwiGLU fused into its epilogue for "
                         "the dense MLP and the MoE experts (see _FusedSwiGLU)")
+    p.add_argument("--fp8-mlp", action=argparse.BooleanOptionalAction, default=False,
+                   help="dense MLP sub-blocks store activations and activation grads in fp8 "
+                        "with fp8 GEMMs while training (delayed per-tensor scaling; see "
+                        "_FP8MLPBlock). Changes numerics; validation stays bf16")
     p.add_argument("--fused-qk-rope", action=argparse.BooleanOptionalAction, default=True,
                    help="one Triton pass each way for q/k RMSNorm + RoPE around "
                         "flash-attn (see _QKNormRoPEAttention)")
@@ -2177,9 +2530,10 @@ def main() -> None:
     elif mlp_only_layers:
         raise ValueError("--mlp-only-layers requires --num-experts > 0")
     data_seed = args.data_seed if args.data_seed is not None else args.seed
-    global FUSED_SWIGLU, FUSED_QK_ROPE
+    global FUSED_SWIGLU, FUSED_QK_ROPE, FP8_MLP
     FUSED_SWIGLU = args.fused_swiglu
     FUSED_QK_ROPE = args.fused_qk_rope
+    FP8_MLP = args.fp8_mlp
 
     rank = int(os.environ.get("RANK", "0"))
     world_size = int(os.environ.get("WORLD_SIZE", "1"))
@@ -2523,6 +2877,8 @@ def main() -> None:
             dist.all_reduce(warm_loss_sum, op=dist.ReduceOp.SUM)
         warm_loss = warm_loss_sum / warm_global_tokens
         model.zero_grad(set_to_none=True)
+        if FP8_MLP:  # the prewarm step's amax seeds the first real step's fp8 scales
+            fp8_update_scales(raw_model)
         torch.cuda.synchronize()
         if is_main:
             prewarm_record = {
@@ -2569,6 +2925,8 @@ def main() -> None:
         last_router_stats = router_stats
         optimizer.step()
         scheduler.step()
+        if FP8_MLP:
+            fp8_update_scales(raw_model)
         local_total_tokens += local_step_tokens
         global_total_tokens += global_step_tokens
         global_compute_tokens += window * world_size
