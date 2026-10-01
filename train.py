@@ -81,7 +81,10 @@ Hard-won GB10 (sm_121) facts -- do not relearn these:
   * Inductor launches user Triton kernels with runtime Python floats typed
     fp64 (Triton's own launcher uses fp32): a float argument silently turns
     the math it touches into fp64 (~1/64 rate on GB10). Make such arguments
-    tl.constexpr. At dim 512 everything but attention is bandwidth-bound, so
+    tl.constexpr. Inductor also clones the whole base tensor (a 100 MB copy per
+    layer here) when a user Triton kernel writes into a view, or receives one
+    buffer as two mutable arguments: pass whole tensors plus offsets, one
+    mutable output per kernel. At dim 512 everything but attention is bandwidth-bound, so
     the win is in fewer passes, not faster ones: the q/k norm + RoPE path was
     9 inductor kernels moving ~2x its minimum bytes (_QKNormRoPEAttention).
 
@@ -368,6 +371,291 @@ def _qk_norm_rope_bwd_kernel(
     tl.store(base + D + HALF, dwk2)
 
 
+# --------------------------------------------------------------------------- #
+# Triton varlen causal GQA attention (replaces flash-attn on the fused path)
+# --------------------------------------------------------------------------- #
+TRITON_ATTENTION = True  # --no-triton-attention falls back to flash-attn varlen
+
+
+@triton.jit
+def _attn_fwd_kernel(Q, K, V, O, LSE, CU, stride_v, v_col, SM_SCALE: tl.constexpr,
+                     HQ: tl.constexpr, HKV: tl.constexpr, D: tl.constexpr,
+                     BLOCK_M: tl.constexpr, BLOCK_N: tl.constexpr):
+    """One (query block, segment, query head) of block-diagonal causal attention:
+    online softmax over the segment's keys up to the block's last row. GQA reads
+    kv head h // (HQ // HKV). Writes O and the row log-sum-exp in base 2."""
+    mb = tl.program_id(0)
+    seq = tl.program_id(1)
+    h = tl.program_id(2)
+    start = tl.load(CU + seq)
+    end = tl.load(CU + seq + 1)
+    q_lo = start + mb * BLOCK_M
+    if q_lo >= end:
+        return
+    hk = h // (HQ // HKV)
+    rm = q_lo + tl.arange(0, BLOCK_M)
+    rd = tl.arange(0, D)
+    rn0 = tl.arange(0, BLOCK_N)
+    qmask = rm < end
+    q = tl.load(Q + rm[:, None] * (HQ * D) + h * D + rd[None, :], mask=qmask[:, None], other=0.0)
+    m_i = tl.full((BLOCK_M,), float("-inf"), tl.float32)
+    l_i = tl.zeros((BLOCK_M,), tl.float32)
+    acc = tl.zeros((BLOCK_M, D), tl.float32)
+    qk_scale = SM_SCALE * 1.4426950408889634
+    for n0 in range(start, tl.minimum(q_lo + BLOCK_M, end), BLOCK_N):
+        rn = n0 + rn0
+        kmask = rn < end
+        k = tl.load(K + rn[None, :] * (HKV * D) + hk * D + rd[:, None], mask=kmask[None, :], other=0.0)
+        s = tl.dot(q, k) * qk_scale
+        s = tl.where((rm[:, None] >= rn[None, :]) & kmask[None, :], s, float("-inf"))
+        m_new = tl.maximum(m_i, tl.max(s, 1))
+        alpha = tl.exp2(m_i - m_new)
+        p = tl.exp2(s - m_new[:, None])
+        l_i = l_i * alpha + tl.sum(p, 1)
+        v = tl.load(V + v_col + rn[:, None] * stride_v + hk * D + rd[None, :], mask=kmask[:, None],
+                    other=0.0)
+        acc = acc * alpha[:, None] + tl.dot(p.to(tl.bfloat16), v)
+        m_i = m_new
+    tl.store(O + rm[:, None] * (HQ * D) + h * D + rd[None, :], (acc / l_i[:, None]).to(tl.bfloat16),
+             mask=qmask[:, None])
+    tl.store(LSE + rm * HQ + h, m_i + tl.log2(l_i), mask=qmask)
+
+
+@triton.jit
+def _qk_norm_rope_bwd_tile(g1, g2, X, x_stride, x_col, RSTD, r_stride, r_col, W, COS, SIN,
+                           POS, rows, rmask, DQKV, dqkv_stride, dqkv_col,
+                           HALF: tl.constexpr, D: tl.constexpr):
+    """Epilogue shared by the fused attention backward kernels: g1/g2 are the two
+    rotate-half halves of d(rotated q or k) for `rows` (already rounded to bf16);
+    applies the RoPE backward (rounded to bf16, as the unfused graph materializes
+    it), then the per-head RMSNorm backward against the pre-norm x read from qkv,
+    writes d(pre-norm) into dqkv and returns the two halves of this tile's
+    norm-weight gradient partial."""
+    m = rmask[:, None]
+    rh = tl.arange(0, HALF)
+    pos = tl.load(POS + rows, mask=rmask, other=0)
+    table = pos[:, None] * D + rh[None, :]
+    cos1 = tl.load(COS + table, mask=m, other=0.0)
+    cos2 = tl.load(COS + table + HALF, mask=m, other=0.0)
+    sin1 = tl.load(SIN + table, mask=m, other=0.0)
+    sin2 = tl.load(SIN + table + HALF, mask=m, other=0.0)
+    dn1 = (g1 * cos1 + g2 * sin2).to(tl.bfloat16).to(tl.float32)
+    dn2 = (g2 * cos2 - g1 * sin1).to(tl.bfloat16).to(tl.float32)
+    xr = X + x_col + rows[:, None] * x_stride + rh[None, :]
+    x1 = tl.load(xr, mask=m, other=0.0).to(tl.float32)
+    x2 = tl.load(xr + HALF, mask=m, other=0.0).to(tl.float32)
+    r = tl.load(RSTD + r_col + rows * r_stride, mask=rmask, other=0.0)
+    w1 = tl.load(W + rh)
+    w2 = tl.load(W + HALF + rh)
+    dw1 = dn1 * w1[None, :]
+    dw2 = dn2 * w2[None, :]
+    s = tl.sum(dw1 * x1, 1) + tl.sum(dw2 * x2, 1)
+    coef = (s * -0.5 * (r * r * r) * (2.0 / D))[:, None]
+    out = DQKV + dqkv_col + rows[:, None] * dqkv_stride + rh[None, :]
+    tl.store(out, (coef * x1 + dw1 * r[:, None]).to(tl.bfloat16), mask=m)
+    tl.store(out + HALF, (coef * x2 + dw2 * r[:, None]).to(tl.bfloat16), mask=m)
+    return tl.sum(dn1 * (x1 * r[:, None]), 0), tl.sum(dn2 * (x2 * r[:, None]), 0)
+
+
+@triton.jit
+def _attn_bwd_pre_kernel(O, DO, DELTA, T, HQ: tl.constexpr, D: tl.constexpr, BLOCK: tl.constexpr):
+    """delta = rowsum(dO * O) per (token, head)."""
+    r = tl.program_id(0) * BLOCK + tl.arange(0, BLOCK)
+    h = tl.program_id(1)
+    rd = tl.arange(0, D)
+    m = (r < T)[:, None]
+    o = tl.load(O + r[:, None] * (HQ * D) + h * D + rd[None, :], mask=m, other=0.0).to(tl.float32)
+    do = tl.load(DO + r[:, None] * (HQ * D) + h * D + rd[None, :], mask=m, other=0.0).to(tl.float32)
+    tl.store(DELTA + r * HQ + h, tl.sum(o * do, 1), mask=r < T)
+
+
+@triton.jit
+def _attn_bwd_dkdv_kernel(Q, K, V, DO, LSE, DELTA, DK, CU, stride_v, v_col, stride_dk, dk_col,
+                          dv_col, X, RSTD, KW, COS, SIN, POS, DWK, n_seq,
+                          SM_SCALE: tl.constexpr, HQ: tl.constexpr, HKV: tl.constexpr,
+                          D: tl.constexpr, BLOCK_M: tl.constexpr, BLOCK_N: tl.constexpr,
+                          FUSE_QK: tl.constexpr):
+    """dK, dV for one (key block, segment, kv head), looping over the kv head's
+    HQ // HKV query heads (native GQA: no per-query-head buffers to sum) and the
+    query blocks at or after the key block. Recomputes P from the saved LSE. DK is
+    one 2-D buffer holding both dk (columns dk_col..) and dv (columns dv_col..):
+    a single mutable argument, since inductor clones a buffer passed to a user
+    kernel twice. With FUSE_QK the epilogue splits dK into its rotate-half halves,
+    applies the RoPE + k-norm backward and writes d(pre-norm k) at dk_col of dqkv,
+    plus this program's k-norm weight-gradient partial into DWK."""
+    HALF: tl.constexpr = D // 2
+    nb = tl.program_id(0)
+    seq = tl.program_id(1)
+    hk = tl.program_id(2)
+    rh = tl.arange(0, HALF)
+    if FUSE_QK:
+        pidx = (nb * n_seq + seq) * HKV + hk
+    start = tl.load(CU + seq)
+    end = tl.load(CU + seq + 1)
+    k_lo = start + nb * BLOCK_N
+    if k_lo >= end:
+        if FUSE_QK:  # every program owns a partial row; empty ones contribute zeros
+            tl.store(DWK + pidx * D + rh, tl.zeros((HALF,), tl.float32))
+            tl.store(DWK + pidx * D + HALF + rh, tl.zeros((HALF,), tl.float32))
+        return
+    rn = k_lo + tl.arange(0, BLOCK_N)
+    rd = tl.arange(0, D)
+    rm0 = tl.arange(0, BLOCK_M)
+    kmask = rn < end
+    k = tl.load(K + rn[:, None] * (HKV * D) + hk * D + rd[None, :], mask=kmask[:, None], other=0.0)
+    v = tl.load(V + v_col + rn[:, None] * stride_v + hk * D + rd[None, :], mask=kmask[:, None], other=0.0)
+    dk = tl.zeros((BLOCK_N, D), tl.float32)
+    dv = tl.zeros((BLOCK_N, D), tl.float32)
+    qk_scale = SM_SCALE * 1.4426950408889634
+    G: tl.constexpr = HQ // HKV
+    m_start = start + ((k_lo - start) // BLOCK_M) * BLOCK_M
+    for g in tl.static_range(G):
+        h = hk * G + g
+        for m0 in range(m_start, end, BLOCK_M):
+            rm = m0 + rm0
+            qmask = rm < end
+            q = tl.load(Q + rm[:, None] * (HQ * D) + h * D + rd[None, :], mask=qmask[:, None], other=0.0)
+            do = tl.load(DO + rm[:, None] * (HQ * D) + h * D + rd[None, :], mask=qmask[:, None], other=0.0)
+            lse = tl.load(LSE + rm * HQ + h, mask=qmask, other=0.0)
+            dl = tl.load(DELTA + rm * HQ + h, mask=qmask, other=0.0)
+            pt = tl.exp2(tl.dot(k, tl.trans(q)) * qk_scale - lse[None, :])
+            pt = tl.where((rm[None, :] >= rn[:, None]) & qmask[None, :], pt, 0.0)
+            dv = tl.dot(pt.to(tl.bfloat16), do, dv)
+            dst = pt * (tl.dot(v, tl.trans(do)) - dl[None, :])
+            dk = tl.dot(dst.to(tl.bfloat16), q, dk)
+    dkb = (dk * SM_SCALE).to(tl.bfloat16)
+    if FUSE_QK:  # split once, in the epilogue, into the rotate-half halves
+        g1, g2 = tl.split(tl.permute(tl.reshape(dkb.to(tl.float32), (BLOCK_N, 2, HALF)), (0, 2, 1)))
+        p1, p2 = _qk_norm_rope_bwd_tile(
+            g1, g2, X, (HQ + 2 * HKV) * D, (HQ + hk) * D,
+            RSTD, HQ + HKV, HQ + hk, KW, COS, SIN, POS, rn, kmask,
+            DK, stride_dk, dk_col + hk * D, HALF=HALF, D=D)
+        tl.store(DWK + pidx * D + rh, p1)
+        tl.store(DWK + pidx * D + HALF + rh, p2)
+    else:
+        tl.store(DK + dk_col + rn[:, None] * stride_dk + hk * D + rd[None, :], dkb, mask=kmask[:, None])
+    tl.store(DK + dv_col + rn[:, None] * stride_dk + hk * D + rd[None, :], dv.to(tl.bfloat16),
+             mask=kmask[:, None])
+
+
+@triton.jit
+def _attn_bwd_dq_kernel(Q, K, V, DO, LSE, DELTA, DQ, CU, stride_v, v_col,
+                        X, RSTD, QW, COS, SIN, POS, DWQ, n_seq, SM_SCALE: tl.constexpr,
+                        HQ: tl.constexpr, HKV: tl.constexpr, D: tl.constexpr,
+                        BLOCK_M: tl.constexpr, BLOCK_N: tl.constexpr, FUSE_QK: tl.constexpr):
+    """dQ for one (query block, segment, query head), accumulated as its two
+    rotate-half halves: no fp32 accumulator buffer, no atomics, no conversion pass.
+    With FUSE_QK the epilogue applies the RoPE + q-norm backward and writes
+    d(pre-norm q) into dqkv (DQ = dqkv base) plus a q-norm weight-gradient partial."""
+    HALF: tl.constexpr = D // 2
+    mb = tl.program_id(0)
+    seq = tl.program_id(1)
+    h = tl.program_id(2)
+    rh = tl.arange(0, HALF)
+    if FUSE_QK:
+        pidx = (mb * n_seq + seq) * HQ + h
+    start = tl.load(CU + seq)
+    end = tl.load(CU + seq + 1)
+    q_lo = start + mb * BLOCK_M
+    if q_lo >= end:
+        if FUSE_QK:
+            tl.store(DWQ + pidx * D + rh, tl.zeros((HALF,), tl.float32))
+            tl.store(DWQ + pidx * D + HALF + rh, tl.zeros((HALF,), tl.float32))
+        return
+    hk = h // (HQ // HKV)
+    rm = q_lo + tl.arange(0, BLOCK_M)
+    rd = tl.arange(0, D)
+    rn0 = tl.arange(0, BLOCK_N)
+    qmask = rm < end
+    q = tl.load(Q + rm[:, None] * (HQ * D) + h * D + rd[None, :], mask=qmask[:, None], other=0.0)
+    do = tl.load(DO + rm[:, None] * (HQ * D) + h * D + rd[None, :], mask=qmask[:, None], other=0.0)
+    lse = tl.load(LSE + rm * HQ + h, mask=qmask, other=0.0)
+    dl = tl.load(DELTA + rm * HQ + h, mask=qmask, other=0.0)
+    dq = tl.zeros((BLOCK_M, D), tl.float32)
+    qk_scale = SM_SCALE * 1.4426950408889634
+    for n0 in range(start, tl.minimum(q_lo + BLOCK_M, end), BLOCK_N):
+        rn = n0 + rn0
+        kmask = rn < end
+        k = tl.load(K + rn[:, None] * (HKV * D) + hk * D + rd[None, :], mask=kmask[:, None], other=0.0)
+        v = tl.load(V + v_col + rn[:, None] * stride_v + hk * D + rd[None, :], mask=kmask[:, None],
+                    other=0.0)
+        p = tl.exp2(tl.dot(q, tl.trans(k)) * qk_scale - lse[:, None])
+        p = tl.where((rm[:, None] >= rn[None, :]) & kmask[None, :], p, 0.0)
+        ds = p * (tl.dot(do, tl.trans(v)) - dl[:, None])
+        dq = tl.dot(ds.to(tl.bfloat16), k, dq)
+    dqb = (dq * SM_SCALE).to(tl.bfloat16)
+    if FUSE_QK:  # split once, in the epilogue, into the rotate-half halves
+        g1, g2 = tl.split(tl.permute(tl.reshape(dqb.to(tl.float32), (BLOCK_M, 2, HALF)), (0, 2, 1)))
+        p1, p2 = _qk_norm_rope_bwd_tile(
+            g1, g2, X, (HQ + 2 * HKV) * D, h * D,
+            RSTD, HQ + HKV, h, QW, COS, SIN, POS, rm, qmask,
+            DQ, (HQ + 2 * HKV) * D, h * D, HALF=HALF, D=D)
+        tl.store(DWQ + pidx * D + rh, p1)
+        tl.store(DWQ + pidx * D + HALF + rh, p2)
+    else:
+        tl.store(DQ + rm[:, None] * (HQ * D) + h * D + rd[None, :], dqb, mask=qmask[:, None])
+
+
+def _triton_attention_fwd(q, k, v_src, v_col, cu_seqlens, max_seqlen, scale):
+    """q (T, Hq, D), k (T, Hkv, D) contiguous; v is columns [v_col, v_col + Hkv*D)
+    of the contiguous 2-D v_src (e.g. qkv). Kernels get whole tensors plus offsets,
+    never views: inductor clones the base of any view a user kernel touches.
+    Returns out (T, Hq, D) and the base-2 LSE (T, Hq)."""
+    total, n_heads, head_dim = q.shape
+    out = torch.empty_like(q)
+    lse = torch.empty(total, n_heads, device=q.device, dtype=torch.float32)
+    _attn_fwd_kernel[(triton.cdiv(max_seqlen, 128), cu_seqlens.shape[0] - 1, n_heads)](
+        q, k, v_src, out, lse, cu_seqlens, v_src.stride(0), v_col, SM_SCALE=scale, HQ=n_heads,
+        HKV=k.shape[1], D=head_dim, BLOCK_M=128, BLOCK_N=64, num_warps=8, num_stages=3)
+    return out, lse
+
+
+def _triton_attention_bwd(dout, q, k, v_src, v_col, out, lse, cu_seqlens, max_seqlen, scale,
+                          dk, dv_dst, dv_col, qk_norm=None):
+    """dv lands in columns [dv_col, dv_col + Hkv*D) of the contiguous 2-D dv_dst
+    (e.g. dqkv). Unfused (dk=None): dk lands in dv_dst's columns [0, Hkv*D) and dq
+    is returned. With qk_norm = (qkv, rstd, q_w, k_w, cos_table, sin_table,
+    position_ids) -- q/k being the rotated, normed heads of that qkv -- the RoPE +
+    qk-norm backward runs in the kernels' epilogues: dq and dk land as d(pre-norm)
+    in dv_dst's q/k columns and the norm-weight gradients are returned: (dq_w, dk_w)."""
+    total, n_heads, head_dim = q.shape
+    n_kv = k.shape[1]
+    n_seq = cu_seqlens.shape[0] - 1
+    dev = q.device
+    delta = torch.empty(total, n_heads, device=dev, dtype=torch.float32)
+    _attn_bwd_pre_kernel[(triton.cdiv(total, 64), n_heads)](
+        out, dout, delta, total, HQ=n_heads, D=head_dim, BLOCK=64, num_warps=4)
+    fuse = qk_norm is not None
+    grid_kv = (triton.cdiv(max_seqlen, 128), n_seq, n_kv)
+    grid_q = (triton.cdiv(max_seqlen, 128), n_seq, n_heads)
+    if fuse:
+        qkv, rstd, q_w, k_w, cos_table, sin_table, position_ids = qk_norm
+        dwk = torch.empty(grid_kv[0] * n_seq * n_kv, head_dim, device=dev, dtype=torch.float32)
+        dwq = torch.empty(grid_q[0] * n_seq * n_heads, head_dim, device=dev, dtype=torch.float32)
+        dq = dv_dst
+        dk_col = n_heads * head_dim  # d(pre-norm k) columns of dqkv
+    else:
+        # unfused: dk and dv share one buffer too (kernels take a single mutable output)
+        qkv = rstd = q_w = k_w = cos_table = sin_table = position_ids = dwk = dwq = q
+        dq = torch.empty_like(q)
+        dk_col = 0
+        assert dk is None, "the unfused path returns dk in dv_dst's columns [0, Hkv*D)"
+    _attn_bwd_dkdv_kernel[grid_kv](
+        q, k, v_src, dout, lse, delta, dv_dst, cu_seqlens, v_src.stride(0), v_col,
+        dv_dst.stride(0), dk_col, dv_col, qkv, rstd, k_w, cos_table, sin_table, position_ids,
+        dwk, n_seq,
+        SM_SCALE=scale, HQ=n_heads, HKV=n_kv, D=head_dim, BLOCK_M=64, BLOCK_N=128,
+        FUSE_QK=fuse, num_warps=8, num_stages=2)
+    _attn_bwd_dq_kernel[grid_q](
+        q, k, v_src, dout, lse, delta, dq, cu_seqlens, v_src.stride(0), v_col,
+        qkv, rstd, q_w, cos_table, sin_table, position_ids, dwq, n_seq, SM_SCALE=scale,
+        HQ=n_heads, HKV=n_kv, D=head_dim, BLOCK_M=128, BLOCK_N=64, FUSE_QK=fuse,
+        num_warps=8, num_stages=2)
+    if fuse:
+        return dwq.sum(0), dwk.sum(0)
+    return dq
+
+
 QK_ROPE_BLOCK_T = 32
 
 
@@ -395,31 +683,44 @@ class _QKNormRoPEAttention(torch.autograd.Function):
         )
         v = qkv[:, (n_heads + n_kv_heads) * head_dim:].view(total, n_kv_heads, head_dim)
         scale = head_dim ** -0.5
-        out, lse, _, rng_state = torch.ops.flash_attn._flash_attn_varlen_forward(
-            q, k, v, cu_seqlens, cu_seqlens, max_seqlen, max_seqlen, 0.0, scale, True,
-        )
+        if TRITON_ATTENTION:
+            out, lse = _triton_attention_fwd(q, k, qkv, (n_heads + n_kv_heads) * head_dim,
+                                             cu_seqlens, max_seqlen, scale)
+            rng_state = None
+        else:
+            out, lse, _, rng_state = torch.ops.flash_attn._flash_attn_varlen_forward(
+                q, k, v, cu_seqlens, cu_seqlens, max_seqlen, max_seqlen, 0.0, scale, True,
+            )
         ctx.save_for_backward(qkv, q_weight, k_weight, cos_table, sin_table, position_ids,
                               cu_seqlens, q, k, out, lse, rstd, rng_state)
-        ctx.shape = (n_heads, n_kv_heads, head_dim, max_seqlen, scale)
+        ctx.shape = (n_heads, n_kv_heads, head_dim, max_seqlen, scale, TRITON_ATTENTION)
         return out
 
     @staticmethod
     def backward(ctx, dout):
         (qkv, q_weight, k_weight, cos_table, sin_table, position_ids,
          cu_seqlens, q, k, out, lse, rstd, rng_state) = ctx.saved_tensors
-        n_heads, n_kv_heads, head_dim, max_seqlen, scale = ctx.shape
+        n_heads, n_kv_heads, head_dim, max_seqlen, scale, triton_attn = ctx.shape
         total = qkv.shape[0]
+        dout = dout.contiguous()
         dqkv = torch.empty_like(qkv)
-        dq = torch.empty_like(q)
         dk = torch.empty_like(k)
         v_cols = slice((n_heads + n_kv_heads) * head_dim, None)
         v = qkv[:, v_cols].view(total, n_kv_heads, head_dim)
-        dv = dqkv[:, v_cols].view(total, n_kv_heads, head_dim)  # flash-attn writes dv in place
-        torch.ops.flash_attn._flash_attn_varlen_backward(
-            dout, q, k, v, out, lse, dq, dk, dv,
-            cu_seqlens, cu_seqlens, max_seqlen, max_seqlen, 0.0, scale, True,
-            -1, -1, 0.0, None, False, rng_state,
-        )
+        dv = dqkv[:, v_cols].view(total, n_kv_heads, head_dim)  # attention writes dv in place
+        if triton_attn:  # RoPE + qk-norm backward fused into the attention epilogues
+            v_col = (n_heads + n_kv_heads) * head_dim
+            dq_w, dk_w = _triton_attention_bwd(
+                dout, q, k, qkv, v_col, out, lse, cu_seqlens, max_seqlen, scale, None, dqkv, v_col,
+                qk_norm=(qkv, rstd, q_weight, k_weight, cos_table, sin_table, position_ids))
+            return (dqkv, dq_w, dk_w, None, None, None, None, None, None, None, None)
+        else:
+            dq = torch.empty_like(q)
+            torch.ops.flash_attn._flash_attn_varlen_backward(
+                dout, q, k, v, out, lse, dq, dk, dv,
+                cu_seqlens, cu_seqlens, max_seqlen, max_seqlen, 0.0, scale, True,
+                -1, -1, 0.0, None, False, rng_state,
+            )
         grid = (triton.cdiv(total, QK_ROPE_BLOCK_T),)
         dw = torch.empty(grid[0], 2, head_dim, device=qkv.device, dtype=torch.float32)
         _qk_norm_rope_bwd_kernel[grid](
@@ -2821,6 +3122,10 @@ def parse_args() -> argparse.Namespace:
                         "activation grads in fp8 with fp8 GEMMs while training (delayed "
                         "per-tensor scaling; see _FP8MLPBlock / _FP8Experts). Changes "
                         "numerics; validation stays bf16")
+    p.add_argument("--triton-attention", action=argparse.BooleanOptionalAction, default=True,
+                   help="Triton varlen causal GQA attention (deterministic, native-GQA "
+                        "backward, no dQ accumulator) on the fused q/k norm + RoPE path; "
+                        "--no-triton-attention uses flash-attn varlen")
     p.add_argument("--fused-qk-rope", action=argparse.BooleanOptionalAction, default=True,
                    help="one Triton pass each way for q/k RMSNorm + RoPE around "
                         "flash-attn (see _QKNormRoPEAttention)")
@@ -2901,10 +3206,11 @@ def main() -> None:
     elif mlp_only_layers:
         raise ValueError("--mlp-only-layers requires --num-experts > 0")
     data_seed = args.data_seed if args.data_seed is not None else args.seed
-    global FUSED_SWIGLU, FUSED_QK_ROPE, FP8_MLP
+    global FUSED_SWIGLU, FUSED_QK_ROPE, FP8_MLP, TRITON_ATTENTION
     FUSED_SWIGLU = args.fused_swiglu
     FUSED_QK_ROPE = args.fused_qk_rope
     FP8_MLP = args.fp8_mlp
+    TRITON_ATTENTION = args.triton_attention
 
     rank = int(os.environ.get("RANK", "0"))
     world_size = int(os.environ.get("WORLD_SIZE", "1"))

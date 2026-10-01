@@ -1,5 +1,63 @@
 # Changes
 
+## 2026-10-01 — Triton attention replaces flash-attn on the default path
+
+Flash-attn was 27% of the fp8 step, and its main kernels were already
+efficient (~55 TFLOP/s); the waste was around them. The backward spent 2.4
+ms/layer outside its main kernel: `dot_do_o` (D = rowsum(dO*O) plus zeroing an
+fp32 dQ accumulator), the fp32 -> bf16 dQ conversion, and the dK/dV sum over
+each GQA group. Then our own kernel re-read dq/dk to apply the RoPE + qk-norm
+backward. `--triton-attention` (default on) replaces flash-attn on the fused
+q/k-norm + RoPE path with four Triton kernels in `train.py`:
+
+- forward: online-softmax varlen causal attention (GQA by kv-head index),
+  base-2 LSE; matches flash-attn's speed (1.20 vs 1.23 ms per layer).
+- backward: a delta preprocess, a dK/dV kernel that owns one kv head and loops
+  over its query heads (native GQA: nothing to sum), and a dQ kernel that writes
+  bf16 directly (no fp32 accumulator, no atomics, no conversion). Both epilogues
+  apply the RoPE + qk-norm backward and write d(pre-norm q/k) straight into
+  `dqkv`, with deterministic per-program norm-weight partials, so the separate
+  q/k-norm backward kernel is gone. P is recomputed twice (~1.4x the main
+  kernel's FLOPs) and the whole backward is still faster: 4.3 vs 5.6 ms before
+  the fusion. The backward is now bit-deterministic.
+- numerics match flash-attn: errors against an fp32 reference are within
+  1.5x of flash-attn's on every output and gradient.
+
+The forward q/k-norm + RoPE stays a separate pass: fusing it would re-normalize
+and re-rotate every K tile once per query block that reads it, with RoPE table
+gathers costing ~1-2 GB of L2 traffic per step.
+
+Inductor pitfalls hit on the way (both cost a full 100 MB copy per layer): a
+user Triton kernel that writes into a *view* makes inductor clone the view's
+base, and so does passing one buffer to a kernel as two mutable arguments --
+kernels get whole tensors plus column offsets, one mutable output each. And
+splitting the inner-loop dots into two half-width (K = 64) products to get the
+rotate-half pairs cost ~20%: the accumulator is split once, in the epilogue.
+
+Throughput (5M tokens, 104 steps, steady window; the `f3226a8` column and the
+dense `--fp8-mlp` row are one fresh compile on each GB10, the rest one run):
+
+| | flash-attn (`f3226a8`) | `--triton-attention` | |
+| --- | ---: | ---: | ---: |
+| dense 50M | 106.4k (462 ms/step) | **115.0k (427 ms)** | +8.1% |
+| dense 50M `--fp8-mlp` | 121.1k-121.3k (405 ms) | **132.6k-133.0k (370 ms)** | +9.5% |
+| MoE 8x2 | 80.0k-80.4k | **85.2k** | +6.2% |
+| MoE 8x2 `--fp8-mlp` | 87.8k-88.1k | **92.4k** | +5.0% |
+| dense 0.6B | 15.3k-15.5k | **16.5k** | +7% |
+| dense 0.6B `--fp8-mlp` | 17.4k-17.7k | **19.3k** | +9.6% |
+| dense 50M, 2 nodes | 204k | **216k** (1.88x) | |
+
+Quality, the 4,100-step parity protocol (final held-out loss): bf16 0.8791 vs
+0.8810 with flash-attn. With `--fp8-mlp`, flash-attn gave 0.8762 twice and this
+path 0.8843, 0.8757 and 0.8761: the first run fell behind by end of warmup
+(1.378 at step 410, the worst of any run) and never recovered, while the other
+two track flash-attn within 0.0005 at every checkpoint -- an unlucky trajectory
+rather than a systematic shift (it was not the GB10: a repeat on the same box
+gave 0.8761).
+
+`--no-triton-attention` restores flash-attn varlen; the unfused
+(`--no-fused-qk-rope`) path keeps using it.
+
 ## 2026-10-01 — `--fp8-mlp` extends to MoE experts
 
 `_FP8Experts` is the MoE twin of `_FP8MLPBlock`: the same fp8 storage
