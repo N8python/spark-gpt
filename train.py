@@ -38,7 +38,7 @@ kv = heads/2, MLP = 3*dim); the Qwen3-0.6B shape (440.7M params) is:
 Canonical runs:
 
   export PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True   # always, on Spark
-  # single node (0.6B shape runs ~14.0k tok/s on one GB10):
+  # single node (0.6B shape runs ~14.7k tok/s on one GB10):
   python train.py --run-name <name> --train-path lang_data/fineweb_2b.jsonl \
       --target-tokens 2000000000 --save-final \
       --val-path lang_data/fineweb_10m_val_fixed_seed0.jsonl

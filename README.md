@@ -177,8 +177,9 @@ host-synchronizing per-expert cuBLAS loop on sm_121). GEMM autotuning
 benchmarks on every rank; identical GB10s pick identical kernels (2-node
 checkpoints verified bit-identical), but on heterogeneous nodes use
 `--no-autotune-gemm`. At the 0.6B shape the
-trainer sustains ~14.0k tok/s on a single GB10 at the default 49,152-token
-window (torch 2.12.0+cu130, flash-attn 2.8.3.post1). That is fixed-shape
+trainer sustains ~14.6-14.8k tok/s on a single GB10 at the default 49,152-token
+window and ~28.2k aggregate on two (1.91x; torch 2.12.0+cu130, flash-attn
+2.8.3.post1). That is fixed-shape
 compute-token throughput; real loss-token throughput is reported separately
 and equals compute throughput times observed packing utilization.
 
@@ -191,9 +192,13 @@ steady window tok/s over the second half of the run), before and after the
 | --- | ---: | ---: | ---: | ---: | ---: |
 | Dense 16L/512d/MLP1536 | 50,617,856 | 50,617,856 | 83.7k | **96.8k-99.3k** | 14.0 GiB |
 | MoE 8 experts/top-2/I768 | 163,929,600 | 50,683,392 | 59.3k | **72.4k-74.5k** | 18.1 GiB |
+| Dense 0.6B 28L/1024d/MLP3072 | 440,997,888 | 440,997,888 | 13.8k-14.0k | **14.6k-14.8k** | 62.9 GiB |
 
 Dense numbers vary by about ±1% between compiles (GEMM autotune picks), so
-they are quoted as ranges. The compute-matched MoE now delivers ~75% of dense
+they are quoted as ranges (the 0.6B ranges are one fresh compile on each of
+two GB10s). The 0.6B shape gains only ~6%, most likely because GEMMs take a
+larger share of the step at width 1024, while most of the kernel work removed
+overhead and bandwidth-bound passes. The compute-matched MoE now delivers ~75% of dense
 throughput (was 69%). Matched 1B-token runs of both defaults (base vs this
 tree, same seed, held-out validation every 5%) end within 0.002 nats/byte of
 each other — MoE 0.7443 vs 0.7434, dense 0.7737 vs 0.7717 — at 20% (MoE) and
