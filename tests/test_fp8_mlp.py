@@ -53,5 +53,36 @@ class FP8MLPBlockTest(unittest.TestCase):
             self.assertLess(err, 0.12, f"{name}: rel err {err:.3e}")
 
 
+class FP8GuardTest(unittest.TestCase):
+    def test_moe_model_trains_with_and_without_fp8_flag(self):
+        # regression: the fp8 guard must not touch sparse blocks' (absent) down_proj
+        if train.triton is None or not torch.cuda.is_available():
+            self.skipTest("CUDA + triton are required")
+        torch.manual_seed(0)
+        config = train.ModelConfig(
+            vocab_size=train.VOCAB_SIZE, hidden_size=256, num_hidden_layers=2,
+            intermediate_size=768, num_attention_heads=2, num_key_value_heads=1,
+            head_dim=128, max_position_embeddings=512, num_experts=4,
+            num_experts_per_tok=2, moe_intermediate_size=128, mlp_only_layers=(0,),
+        )
+        model = train.ByteLM(config).cuda().train()
+        T = 256
+        ids = torch.randint(0, 256, (T,), device="cuda")
+        cu = torch.tensor([0, 100, T], device="cuda", dtype=torch.int32)
+        pos = torch.cat([torch.arange(100), torch.arange(T - 100)]).cuda()
+        saved = train.FP8_MLP
+        try:
+            for flag in (False, True):
+                train.FP8_MLP = flag
+                with torch.amp.autocast("cuda", dtype=torch.bfloat16):
+                    logits, router_logits, _ = model(ids, pos, cu, 156, output_router_logits=True)
+                logits.float().sum().backward()
+                self.assertEqual(len(router_logits), 1)
+                self.assertTrue(torch.isfinite(logits).all())
+                model.zero_grad(set_to_none=True)
+        finally:
+            train.FP8_MLP = saved
+
+
 if __name__ == "__main__":
     unittest.main()
