@@ -108,8 +108,8 @@ torchrun --nnodes 2 --node-rank <0|1> --nproc-per-node 1 \
 ```
 
 Defaults are a 50M model (16 layers / 512 dim / 4Q+2KV heads / head_dim 128)
-on 1B tokens — about 3h on one GB10 (~94-99k tok/s), ~1.5h on two (~192k
-aggregate, ~1.95× single-node). The Qwen3-0.6B shape (440M non-embedding params) is
+on 1B tokens — about 2.7h on one GB10 (~105k tok/s), ~1.4h on two (~204k
+aggregate, ~1.91× single-node). The Qwen3-0.6B shape (440M non-embedding params) is
 `--model-layers 28 --model-dim 1024 --attention-heads 16 --kv-heads 8
 --intermediate-size 3072` — same hyperparameters, muP transfers them.
 
@@ -173,36 +173,42 @@ bandwidth-bound), and always set
 `PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True`. The dense MLP and the
 MoE experts run on hand-written Triton grouped GEMMs with the SwiGLU fused
 into the epilogue (`--fused-swiglu`, on by default; `torch._grouped_mm` is a
-host-synchronizing per-expert cuBLAS loop on sm_121). GEMM autotuning
+host-synchronizing per-expert cuBLAS loop on sm_121), and the q/k RMSNorm +
+RoPE around flash-attn is one Triton pass each way (`--fused-qk-rope`, on by
+default). GEMM autotuning
 benchmarks on every rank; identical GB10s pick identical kernels (2-node
 checkpoints verified bit-identical), but on heterogeneous nodes use
 `--no-autotune-gemm`. At the 0.6B shape the
-trainer sustains ~14.6-14.8k tok/s on a single GB10 at the default 49,152-token
-window and ~28.2k aggregate on two (1.91x; torch 2.12.0+cu130, flash-attn
-2.8.3.post1). That is fixed-shape
+trainer sustains ~15.3-15.5k tok/s on a single GB10 at the default 49,152-token
+window (~28.2k aggregate on two before the 2026-09-30 changes; torch
+2.12.0+cu130, flash-attn 2.8.3.post1). That is fixed-shape
 compute-token throughput; real loss-token throughput is reported separately
 and equals compute throughput times observed packing utilization.
 
 Single-GB10 comparison on the same checksum-pinned FineWeb stream (`seed=0`,
 5,001,341 real tokens, 104 steps, 49,152 tokens/step, compile `default`,
 steady window tok/s over the second half of the run), before and after the
-2026-08-23 kernel work (see [CHANGES.md](CHANGES.md)):
+2026-08-23 and 2026-09-30 kernel work (see [CHANGES.md](CHANGES.md)):
 
-| Model | Total params | Active params | Window tok/s @ `40096c0` | Window tok/s now | Peak allocation |
-| --- | ---: | ---: | ---: | ---: | ---: |
-| Dense 16L/512d/MLP1536 | 50,617,856 | 50,617,856 | 83.7k | **96.8k-99.3k** | 14.0 GiB |
-| MoE 8 experts/top-2/I768 | 163,929,600 | 50,683,392 | 59.3k | **72.4k-74.5k** | 18.1 GiB |
-| Dense 0.6B 28L/1024d/MLP3072 | 440,997,888 | 440,997,888 | 13.8k-14.0k | **14.6k-14.8k** | 62.9 GiB |
+| Model | Total params | Active params | Window tok/s @ `40096c0` | @ `cbb60d6` (08-23) | Window tok/s now | Peak allocation |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: |
+| Dense 16L/512d/MLP1536 | 50,617,856 | 50,617,856 | 83.7k | 96.8k-99.6k | **106.7k-106.8k** | 14.0 GiB |
+| MoE 8 experts/top-2/I768 | 163,929,600 | 50,683,392 | 59.3k | 72.4k-74.9k | **80.1k-80.3k** | 18.1 GiB |
+| Dense 0.6B 28L/1024d/MLP3072 | 440,997,888 | 440,997,888 | 13.8k-14.0k | 14.6k-14.8k | **15.3k-15.5k** | 63.2 GiB |
 
 Dense numbers vary by about ±1% between compiles (GEMM autotune picks), so
-they are quoted as ranges (the 0.6B ranges are one fresh compile on each of
-two GB10s). The 0.6B shape gains only ~6%, most likely because GEMMs take a
-larger share of the step at width 1024, while most of the kernel work removed
-overhead and bandwidth-bound passes. The compute-matched MoE now delivers ~75% of dense
+they are quoted as ranges (the 0.6B and 2026-09-30 ranges are one fresh
+compile on each of two GB10s). The 0.6B shape gains less (~11% over
+`40096c0`, vs ~28% dense), most likely because GEMMs take a larger share of
+the step at width 1024, while most of the kernel work removed overhead and
+bandwidth-bound passes. The compute-matched MoE delivers ~75% of dense
 throughput (was 69%). Matched 1B-token runs of both defaults (base vs this
 tree, same seed, held-out validation every 5%) end within 0.002 nats/byte of
 each other — MoE 0.7443 vs 0.7434, dense 0.7737 vs 0.7717 — at 20% (MoE) and
 15% (dense) less wall time; the optimizations do not change what is trained.
+The 2026-09-30 changes were checked the same way on a 4,100-step (~200M
+token) prefix of the dense schedule: held-out loss ahead or tied at all ten
+checkpoints, 0.8810 vs 0.8817 at the end.
 
 ## License
 

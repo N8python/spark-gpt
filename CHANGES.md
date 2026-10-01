@@ -1,5 +1,67 @@
 # Changes
 
+## 2026-09-30 — fused q/k norm + RoPE, SwiGLU backward tiles
+
+Kernel-level trace of the compiled 50M step (489 ms, no idle gaps): GEMMs
+261 ms (the 147 ms of fused-SwiGLU GEMMs included), flash-attn 105 ms,
+q/k norm + RoPE 56 ms, main RMSNorm 42 ms, optimizer 20 ms. At dim 512
+everything outside attention is bandwidth-bound — the non-SwiGLU GEMMs
+already run at ~190-237 GB/s — so the remaining wins are passes removed,
+not faster kernels.
+
+1. **`--fused-qk-rope` (default on), `_QKNormRoPEAttention`.** The q/k
+   RMSNorm + RoPE path was 2 forward and 7 backward inductor kernels moving
+   ~575 MB/layer in the backward against a ~275 MB minimum: two
+   weight-gradient reductions re-read the RoPE gradient, the forward saved
+   contiguous copies of pre-norm q/k that already live in `qkv`, and one
+   kernel only copied dv into the dqkv buffer. Now one Triton kernel each
+   way: the forward reads q/k straight out of `qkv` and writes rotated q/k +
+   a per-head rstd; flash-attn writes dv directly into its slice of dqkv;
+   the backward does RoPE + norm backward for every q/k head of a token block
+   in one pass with deterministic per-program norm-weight partial sums.
+   Attention block fwd+bwd 15.2 -> 13.3 ms/layer. Numerics: the forward is
+   correctly rounded against an fp64 reference (the compiled unfused path:
+   70%), and every gradient (dq, dk, dv, both norm weights) is closer to fp64
+   than the unfused path's.
+2. **SwiGLU backward tiles.** dgrad 64x64x32/4 warps -> 128x128x32/8 warps,
+   wgrad (32, 64, 128)/4 warps -> (64, 64, 256)/8 warps: halves the per-tile
+   SwiGLU-derivative recompute. Bit-identical output; dgrad 1.08x dense /
+   1.19x MoE, wgrad 1.07x / 1.06x. The forward's 64x64x32 was already the
+   best of 49 configs.
+
+Found along the way: inductor launches user Triton kernels with runtime
+Python floats typed **fp64** (Triton's own launcher uses fp32), which made
+the first fused forward 2.9x slower in-graph than standalone; float kernel
+arguments must be `tl.constexpr`.
+
+Same protocol as below (5M tokens, 104 steps, seed 0, steady window over the
+second half, fresh compile per run), one run per tree on each GB10:
+
+| | dense 50M | MoE 8x2 | 0.6B | peak alloc |
+| --- | ---: | ---: | ---: | --- |
+| `cbb60d6` | 99.6k (493 ms/step) | 74.8k-74.9k (656 ms) | 14.6k-14.8k | unchanged |
+| + SwiGLU tiles only | 100.8k-100.9k (+1.2%) | | | |
+| 2 nodes (alice + bob), dense | | | | 192k -> **204k aggregate** (1.91x) |
+| + fused q/k norm + RoPE | **106.7k-106.8k (+7.2%, 460 ms)** | **80.1k-80.3k (+7.1%, 612 ms)** | **15.3k-15.5k (+4.5%)** | 13.96 / 18.10 / 63.2 GiB |
+
+Matched dense run, `cbb60d6` (bob) vs this tree (alice): the 1B-token
+schedule truncated at 4,100 steps (~200M tokens, `--max-train-steps 4100`),
+held-out `fineweb_10m_val_fixed_seed0` every 410 steps. This tree is ahead or
+tied at every checkpoint and trains the 4,100 steps 7.1% faster
+(1,884 s vs 2,027 s):
+
+| step | 410 | 820 | 1230 | 1640 | 2050 | 2460 | 2870 | 3280 | 3690 | 4100 |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
+| `cbb60d6` val | 1.3744 | 1.1010 | 1.0305 | 0.9878 | 0.9581 | 0.9342 | 0.9144 | 0.8993 | 0.8883 | 0.8817 |
+| this tree | 1.3692 | 1.0989 | 1.0297 | 0.9878 | 0.9573 | 0.9332 | 0.9137 | 0.8986 | 0.8876 | 0.8810 |
+
+Measured and not adopted: fp8 GEMMs at dim 512 (`_scaled_mm` is 1.25-2x
+faster per GEMM, saving at most ~74 ms/step, but operand quantization costs
+~143 ms/step even with delayed scaling, and fp8 dgrad would re-materialize
+`d_gate_up`); a custom flash-attn build (its main backward kernel already
+runs at ~55 TFLOP/s; the recoverable ~3.5% is in side passes — the GQA
+dk/dv sum and fp32 dq conversion — that need a patched FA2 extension).
+
 ## 2026-08-23 — GB10 throughput optimization (dense 50M and MoE 8x2)
 
 Two parallel optimization sessions on top of `40096c0`, merged here. The

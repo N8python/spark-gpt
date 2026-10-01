@@ -38,7 +38,7 @@ kv = heads/2, MLP = 3*dim); the Qwen3-0.6B shape (440.7M params) is:
 Canonical runs:
 
   export PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True   # always, on Spark
-  # single node (0.6B shape runs ~14.7k tok/s on one GB10):
+  # single node (0.6B shape runs ~15.4k tok/s on one GB10):
   python train.py --run-name <name> --train-path lang_data/fineweb_2b.jsonl \
       --target-tokens 2000000000 --save-final \
       --val-path lang_data/fineweb_10m_val_fixed_seed0.jsonl
@@ -78,6 +78,12 @@ Hard-won GB10 (sm_121) facts -- do not relearn these:
     autotuned) so DDP ranks stay bit-identical.
   * flash-attn >= 2.7 varlen is a torch custom op: keep it INSIDE the
     compiled graph (one graph per fwd/bwd), with cu_seqlens mark_dynamic'd.
+  * Inductor launches user Triton kernels with runtime Python floats typed
+    fp64 (Triton's own launcher uses fp32): a float argument silently turns
+    the math it touches into fp64 (~1/64 rate on GB10). Make such arguments
+    tl.constexpr. At dim 512 everything but attention is bandwidth-bound, so
+    the win is in fewer passes, not faster ones: the q/k norm + RoPE path was
+    9 inductor kernels moving ~2x its minimum bytes (_QKNormRoPEAttention).
 
 Checkpoints: --save-final writes model_final.pt (native fused layout) plus a
 READY-TO-LOAD HF directory checkpoints/<run>/hf/ (stock Qwen3ForCausalLM or
@@ -197,9 +203,20 @@ class Attention(nn.Module):
         rotate_half = torch.cat((-x[..., half:], x[..., :half]), dim=-1)
         return x * cos.to(x.dtype)[:, None, :] + rotate_half * sin.to(x.dtype)[:, None, :]
 
-    def forward(self, x, cos, sin, cu_seqlens, max_seqlen):
+    def forward(self, x, rope, cu_seqlens, max_seqlen):
+        # rope = (cos, sin, cos_table, sin_table, position_ids): the per-token
+        # rows for the unfused path, the fp32 tables + positions for the fused one.
+        cos, sin, cos_table, sin_table, position_ids = rope
         total = x.shape[0]
-        q, k, v = self.qkv_proj(x).split(
+        qkv = self.qkv_proj(x)
+        if _use_fused_qk_rope(qkv, self.head_dim):
+            out = _QKNormRoPEAttention.apply(
+                qkv, self.q_norm.weight, self.k_norm.weight, cos_table, sin_table,
+                position_ids, cu_seqlens, max_seqlen, self.n_heads, self.n_kv_heads,
+                self.q_norm.eps,
+            )
+            return self.o_proj(out.reshape(total, self.n_heads * self.head_dim))
+        q, k, v = qkv.split(
             [self.n_heads * self.head_dim,
              self.n_kv_heads * self.head_dim,
              self.n_kv_heads * self.head_dim],
@@ -225,6 +242,191 @@ class MLP(nn.Module):
             return self.down_proj(_FusedSwiGLU.apply(x, weight, offs))
         gate, up = self.gate_up_proj(x).chunk(2, dim=-1)
         return self.down_proj(F.silu(gate) * up)
+
+
+# --------------------------------------------------------------------------- #
+# Fused qk-norm + RoPE around flash-attn varlen (Triton)
+# --------------------------------------------------------------------------- #
+FUSED_QK_ROPE = True  # --no-fused-qk-rope falls back to separate norm/RoPE ops
+
+
+def _use_fused_qk_rope(qkv: torch.Tensor, head_dim: int) -> bool:
+    # the kernels tile each head as two power-of-two halves
+    return (FUSED_QK_ROPE and triton is not None and qkv.is_cuda
+            and qkv.dtype == torch.bfloat16 and head_dim >= 32
+            and head_dim & (head_dim - 1) == 0)
+
+
+@triton.jit
+def _qk_norm_rope_fwd_kernel(
+    QKV, QW, KW, COS, SIN, POS, QOUT, KOUT, RSTD,
+    T, stride_qkv,
+    EPS: tl.constexpr, HQ: tl.constexpr, HKV: tl.constexpr, D: tl.constexpr,
+    BLOCK_T: tl.constexpr,
+):
+    """q/k heads of one token block: per-head RMSNorm (fp32) then rotate-half
+    RoPE, one bf16 rounding at the store (correctly rounded vs an fp64
+    reference). Each head is handled as its two contiguous halves so
+    rotate-half needs no permuted (unvectorizable) loads. EPS is a constexpr:
+    inductor passes runtime Python floats as fp64, which would promote the
+    rstd math to fp64."""
+    HALF: tl.constexpr = D // 2
+    rt = tl.program_id(0) * BLOCK_T + tl.arange(0, BLOCK_T)
+    rh = tl.arange(0, HALF)
+    t_mask = rt < T
+    m = t_mask[:, None]
+    pos = tl.load(POS + rt, mask=t_mask, other=0)
+    table = pos[:, None] * D + rh[None, :]
+    cos1 = tl.load(COS + table, mask=m, other=0.0)
+    cos2 = tl.load(COS + table + HALF, mask=m, other=0.0)
+    sin1 = tl.load(SIN + table, mask=m, other=0.0)
+    sin2 = tl.load(SIN + table + HALF, mask=m, other=0.0)
+    for h in tl.static_range(HQ + HKV):
+        if h < HQ:
+            w1 = tl.load(QW + rh)
+            w2 = tl.load(QW + HALF + rh)
+            out_ptrs = QOUT + rt[:, None] * (HQ * D) + h * D + rh[None, :]
+        else:
+            w1 = tl.load(KW + rh)
+            w2 = tl.load(KW + HALF + rh)
+            out_ptrs = KOUT + rt[:, None] * (HKV * D) + (h - HQ) * D + rh[None, :]
+        row = QKV + rt[:, None] * stride_qkv + h * D + rh[None, :]
+        x1 = tl.load(row, mask=m, other=0.0).to(tl.float32)
+        x2 = tl.load(row + HALF, mask=m, other=0.0).to(tl.float32)
+        rstd = tl.rsqrt((tl.sum(x1 * x1, 1) + tl.sum(x2 * x2, 1)) / D + EPS)
+        n1 = x1 * rstd[:, None] * w1[None, :]
+        n2 = x2 * rstd[:, None] * w2[None, :]
+        tl.store(out_ptrs, (n1 * cos1 - n2 * sin1).to(tl.bfloat16), mask=m)
+        tl.store(out_ptrs + HALF, (n2 * cos2 + n1 * sin2).to(tl.bfloat16), mask=m)
+        tl.store(RSTD + rt * (HQ + HKV) + h, rstd, mask=t_mask)
+
+
+@triton.jit
+def _qk_norm_rope_bwd_kernel(
+    DQ, DK, QKV, QW, KW, COS, SIN, POS, RSTD, DQKV, DW,
+    T, stride_qkv, stride_dqkv,
+    HQ: tl.constexpr, HKV: tl.constexpr, D: tl.constexpr, BLOCK_T: tl.constexpr,
+):
+    """RoPE backward, then RMSNorm backward, for the q/k heads of one token
+    block, written straight into the dq/dk columns of dqkv. Per-program partial
+    norm-weight gradients go to DW[pid, 0 (q) | 1 (k), :] and are summed on the
+    host side (deterministic, no atomics). The RoPE gradient is rounded to bf16
+    before the norm backward, as the unfused graph materializes it in bf16."""
+    HALF: tl.constexpr = D // 2
+    pid = tl.program_id(0)
+    rt = pid * BLOCK_T + tl.arange(0, BLOCK_T)
+    rh = tl.arange(0, HALF)
+    t_mask = rt < T
+    m = t_mask[:, None]
+    pos = tl.load(POS + rt, mask=t_mask, other=0)
+    table = pos[:, None] * D + rh[None, :]
+    cos1 = tl.load(COS + table, mask=m, other=0.0)
+    cos2 = tl.load(COS + table + HALF, mask=m, other=0.0)
+    sin1 = tl.load(SIN + table, mask=m, other=0.0)
+    sin2 = tl.load(SIN + table + HALF, mask=m, other=0.0)
+    dwq1 = tl.zeros((HALF,), dtype=tl.float32)
+    dwq2 = tl.zeros((HALF,), dtype=tl.float32)
+    dwk1 = tl.zeros((HALF,), dtype=tl.float32)
+    dwk2 = tl.zeros((HALF,), dtype=tl.float32)
+    for h in tl.static_range(HQ + HKV):
+        if h < HQ:
+            w1 = tl.load(QW + rh)
+            w2 = tl.load(QW + HALF + rh)
+            g_row = DQ + rt[:, None] * (HQ * D) + h * D + rh[None, :]
+        else:
+            w1 = tl.load(KW + rh)
+            w2 = tl.load(KW + HALF + rh)
+            g_row = DK + rt[:, None] * (HKV * D) + (h - HQ) * D + rh[None, :]
+        g1 = tl.load(g_row, mask=m, other=0.0).to(tl.float32)
+        g2 = tl.load(g_row + HALF, mask=m, other=0.0).to(tl.float32)
+        dn1 = (g1 * cos1 + g2 * sin2).to(tl.bfloat16).to(tl.float32)
+        dn2 = (g2 * cos2 - g1 * sin1).to(tl.bfloat16).to(tl.float32)
+        row = QKV + rt[:, None] * stride_qkv + h * D + rh[None, :]
+        x1 = tl.load(row, mask=m, other=0.0).to(tl.float32)
+        x2 = tl.load(row + HALF, mask=m, other=0.0).to(tl.float32)
+        r = tl.load(RSTD + rt * (HQ + HKV) + h, mask=t_mask, other=0.0)
+        dw1 = dn1 * w1[None, :]
+        dw2 = dn2 * w2[None, :]
+        s = tl.sum(dw1 * x1, 1) + tl.sum(dw2 * x2, 1)
+        if h < HQ:
+            dwq1 += tl.sum(dn1 * (x1 * r[:, None]), 0)
+            dwq2 += tl.sum(dn2 * (x2 * r[:, None]), 0)
+        else:
+            dwk1 += tl.sum(dn1 * (x1 * r[:, None]), 0)
+            dwk2 += tl.sum(dn2 * (x2 * r[:, None]), 0)
+        coef = (s * -0.5 * (r * r * r) * (2.0 / D))[:, None]
+        out_ptrs = DQKV + rt[:, None] * stride_dqkv + h * D + rh[None, :]
+        tl.store(out_ptrs, (coef * x1 + dw1 * r[:, None]).to(tl.bfloat16), mask=m)
+        tl.store(out_ptrs + HALF, (coef * x2 + dw2 * r[:, None]).to(tl.bfloat16), mask=m)
+    base = DW + pid * (2 * D) + rh
+    tl.store(base, dwq1)
+    tl.store(base + HALF, dwq2)
+    tl.store(base + D, dwk1)
+    tl.store(base + D + HALF, dwk2)
+
+
+QK_ROPE_BLOCK_T = 32
+
+
+class _QKNormRoPEAttention(torch.autograd.Function):
+    """qkv (T, (Hq + 2 Hkv) D) -> per-head q/k RMSNorm -> RoPE -> causal varlen
+    flash-attn. Replaces two forward and seven backward elementwise kernels:
+    pre-norm q/k are read straight out of qkv (no saved copies), the norm and
+    RoPE backward run in one pass, and flash-attn writes dv directly into its
+    slice of dqkv. Norm weights stay fp32, as in the compiled unfused path."""
+
+    @staticmethod
+    def forward(ctx, qkv, q_weight, k_weight, cos_table, sin_table, position_ids,
+                cu_seqlens, max_seqlen, n_heads, n_kv_heads, eps):
+        total = qkv.shape[0]
+        head_dim = cos_table.shape[1]
+        q = torch.empty(total, n_heads, head_dim, device=qkv.device, dtype=qkv.dtype)
+        k = torch.empty(total, n_kv_heads, head_dim, device=qkv.device, dtype=qkv.dtype)
+        rstd = torch.empty(total, n_heads + n_kv_heads, device=qkv.device, dtype=torch.float32)
+        grid = (triton.cdiv(total, QK_ROPE_BLOCK_T),)
+        _qk_norm_rope_fwd_kernel[grid](
+            qkv, q_weight, k_weight, cos_table, sin_table, position_ids, q, k, rstd,
+            total, qkv.stride(0),
+            EPS=eps, HQ=n_heads, HKV=n_kv_heads, D=head_dim, BLOCK_T=QK_ROPE_BLOCK_T,
+            num_warps=4,
+        )
+        v = qkv[:, (n_heads + n_kv_heads) * head_dim:].view(total, n_kv_heads, head_dim)
+        scale = head_dim ** -0.5
+        out, lse, _, rng_state = torch.ops.flash_attn._flash_attn_varlen_forward(
+            q, k, v, cu_seqlens, cu_seqlens, max_seqlen, max_seqlen, 0.0, scale, True,
+        )
+        ctx.save_for_backward(qkv, q_weight, k_weight, cos_table, sin_table, position_ids,
+                              cu_seqlens, q, k, out, lse, rstd, rng_state)
+        ctx.shape = (n_heads, n_kv_heads, head_dim, max_seqlen, scale)
+        return out
+
+    @staticmethod
+    def backward(ctx, dout):
+        (qkv, q_weight, k_weight, cos_table, sin_table, position_ids,
+         cu_seqlens, q, k, out, lse, rstd, rng_state) = ctx.saved_tensors
+        n_heads, n_kv_heads, head_dim, max_seqlen, scale = ctx.shape
+        total = qkv.shape[0]
+        dqkv = torch.empty_like(qkv)
+        dq = torch.empty_like(q)
+        dk = torch.empty_like(k)
+        v_cols = slice((n_heads + n_kv_heads) * head_dim, None)
+        v = qkv[:, v_cols].view(total, n_kv_heads, head_dim)
+        dv = dqkv[:, v_cols].view(total, n_kv_heads, head_dim)  # flash-attn writes dv in place
+        torch.ops.flash_attn._flash_attn_varlen_backward(
+            dout, q, k, v, out, lse, dq, dk, dv,
+            cu_seqlens, cu_seqlens, max_seqlen, max_seqlen, 0.0, scale, True,
+            -1, -1, 0.0, None, False, rng_state,
+        )
+        grid = (triton.cdiv(total, QK_ROPE_BLOCK_T),)
+        dw = torch.empty(grid[0], 2, head_dim, device=qkv.device, dtype=torch.float32)
+        _qk_norm_rope_bwd_kernel[grid](
+            dq, dk, qkv, q_weight, k_weight, cos_table, sin_table, position_ids, rstd,
+            dqkv, dw, total, qkv.stride(0), dqkv.stride(0),
+            HQ=n_heads, HKV=n_kv_heads, D=head_dim, BLOCK_T=QK_ROPE_BLOCK_T,
+            num_warps=4,
+        )
+        dw = dw.sum(0)
+        return (dqkv, dw[0], dw[1], None, None, None, None, None, None, None, None)
 
 
 # --------------------------------------------------------------------------- #
@@ -623,7 +825,9 @@ def _swiglu_wgrad_kernel(
     tl.store(base + I * stride_on, acc_u.to(tl.bfloat16), mask=out_mask)
 
 
-def _swiglu_dgrad(gu, dh, w, offs, *, BLOCK_M=64, BLOCK_N=64, BLOCK_K=32, num_warps=4, num_stages=3):
+def _swiglu_dgrad(gu, dh, w, offs, *, BLOCK_M=128, BLOCK_N=128, BLOCK_K=32, num_warps=8, num_stages=3):
+    # 128x128 tiles halve the per-tile SwiGLU-derivative recompute along N:
+    # 1.08x dense / 1.19x MoE over 64x64 on GB10, bit-identical output.
     R, twoI = gu.shape
     I = twoI // 2
     E, _, N = w.shape
@@ -636,7 +840,9 @@ def _swiglu_dgrad(gu, dh, w, offs, *, BLOCK_M=64, BLOCK_N=64, BLOCK_K=32, num_wa
     return out
 
 
-def _swiglu_wgrad(gu, dh, x, offs, *, BLOCK_R=32, BLOCK_N=64, BLOCK_K=128, num_warps=4, num_stages=2):
+def _swiglu_wgrad(gu, dh, x, offs, *, BLOCK_R=64, BLOCK_N=64, BLOCK_K=256, num_warps=8, num_stages=2):
+    # K=256 tiles halve the derivative recompute along K: 1.07x dense /
+    # 1.06x MoE over (32, 64, 128) on GB10, bit-identical output.
     R, twoI = gu.shape
     I = twoI // 2
     K = x.shape[1]
@@ -884,8 +1090,8 @@ class Block(nn.Module):
         self.input_layernorm = RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
         self.post_attention_layernorm = RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
 
-    def forward(self, x, cos, sin, cu_seqlens, max_seqlen):
-        h = x + self.self_attn(self.input_layernorm(x), cos, sin, cu_seqlens, max_seqlen)
+    def forward(self, x, rope, cu_seqlens, max_seqlen):
+        h = x + self.self_attn(self.input_layernorm(x), rope, cu_seqlens, max_seqlen)
         mlp_input = self.post_attention_layernorm(h)
         if self.is_sparse:
             mlp_output, router_logits, selected_experts = self.mlp(mlp_input)
@@ -943,11 +1149,12 @@ class ByteLM(nn.Module):
         # rather than recasting both tables for q and k in every layer.
         cos = self.cos_cached[position_ids].to(dtype=rope_dtype)
         sin = self.sin_cached[position_ids].to(dtype=rope_dtype)
+        rope = (cos, sin, self.cos_cached, self.sin_cached, position_ids)
         router_logits = []
         selected_experts = []
         for layer in self.layers:
             x, layer_router_logits, layer_selected_experts = layer(
-                x, cos, sin, cu_seqlens, max_seqlen
+                x, rope, cu_seqlens, max_seqlen
             )
             if layer_router_logits is not None:
                 router_logits.append(layer_router_logits)
@@ -1890,6 +2097,9 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--fused-swiglu", action=argparse.BooleanOptionalAction, default=True,
                    help="Triton grouped GEMM with the SwiGLU fused into its epilogue for "
                         "the dense MLP and the MoE experts (see _FusedSwiGLU)")
+    p.add_argument("--fused-qk-rope", action=argparse.BooleanOptionalAction, default=True,
+                   help="one Triton pass each way for q/k RMSNorm + RoPE around "
+                        "flash-attn (see _QKNormRoPEAttention)")
     p.add_argument("--seed", type=int, default=0)
     p.add_argument("--data-seed", type=int, default=None, help="default: --seed")
     p.add_argument("--log-every", type=int, default=50)
@@ -1967,8 +2177,9 @@ def main() -> None:
     elif mlp_only_layers:
         raise ValueError("--mlp-only-layers requires --num-experts > 0")
     data_seed = args.data_seed if args.data_seed is not None else args.seed
-    global FUSED_SWIGLU
+    global FUSED_SWIGLU, FUSED_QK_ROPE
     FUSED_SWIGLU = args.fused_swiglu
+    FUSED_QK_ROPE = args.fused_qk_rope
 
     rank = int(os.environ.get("RANK", "0"))
     world_size = int(os.environ.get("WORLD_SIZE", "1"))
