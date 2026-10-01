@@ -435,7 +435,7 @@ class _QKNormRoPEAttention(torch.autograd.Function):
 # --------------------------------------------------------------------------- #
 # fp8 MLP sub-block (Triton): RMSNorm -> SwiGLU MLP -> residual, fp8 storage
 # --------------------------------------------------------------------------- #
-FP8_MLP = False  # --fp8-mlp: dense MLP sub-blocks keep activations/grads in fp8 while training
+FP8_MLP = False  # --fp8-mlp: dense MLPs and MoE experts keep activations/grads in fp8 while training
 
 # Per-layer fp8 state (MLP buffers fp8_scale / fp8_amax, one slot per tensor):
 #   0 = x (normed MLP input, e4m3), 1 = gu (gate/up pre-activation, e4m3),
@@ -460,9 +460,9 @@ def _use_fp8_mlp(block, h: torch.Tensor) -> bool:
 
 @torch.no_grad()
 def fp8_update_scales(model: nn.Module) -> None:
-    """Roll every MLP's recorded amax into next step's quantization scales."""
+    """Roll every fp8 MLP / expert block's recorded amax into next step's scales."""
     for m in model.modules():
-        if isinstance(m, MLP):
+        if isinstance(m, (MLP, Experts)):
             fmax = m.fp8_scale.new_tensor(FP8_SITE_MAX)
             new = torch.exp2(torch.floor(torch.log2(fmax / m.fp8_amax.clamp(min=1e-30)))
                              - FP8_HEADROOM_BINADES)
@@ -774,6 +774,359 @@ class _FP8MLPBlock(torch.autograd.Function):
             dgu8, x8t, dwgu, scale[3:], scale[0:], 2 * I, D, T_, 1, 2 * I, 1, T_,
             BLOCK_M=128, BLOCK_N=128, BLOCK_K=64, GROUP_M=8, num_warps=4, num_stages=3)
         return dh, dnw.sum(0), dwgu, dwd, None, None, None
+
+
+# --------------------------------------------------------------------------- #
+# fp8 MoE experts (Triton): grouped versions of the _FP8MLPBlock kernels
+# --------------------------------------------------------------------------- #
+def _use_fp8_moe(experts, x: torch.Tensor) -> bool:
+    if not (FP8_MLP and experts.training and triton is not None and x.is_cuda
+            and x.dtype == torch.bfloat16):
+        return False
+    d, inter = experts.hidden_dim, experts.intermediate_dim
+    return d % 128 == 0 and d & (d - 1) == 0 and inter % 128 == 0
+
+
+@triton.jit
+def _expert_tile(OFFS, pid, N, E: tl.constexpr, BLOCK_M: tl.constexpr, BLOCK_N: tl.constexpr,
+                 GROUP_M: tl.constexpr):
+    """Map a program id onto (expert, m tile, n tile) of a grouped GEMM whose rows
+    are sorted by expert (OFFS = inclusive row-count prefix sums). The grid is
+    sized for the worst case, so trailing programs find no tile."""
+    num_n = tl.cdiv(N, BLOCK_N)
+    tile = pid
+    row_start = 0
+    expert = 0
+    found = False
+    m_tile = 0
+    n_tile = 0
+    rows_e = 0
+    for e in tl.static_range(E):
+        end = tl.load(OFFS + e)
+        n_rows = end - row_start
+        n_m = tl.cdiv(n_rows, BLOCK_M)
+        n_tiles = n_m * num_n
+        if (not found) and (tile < n_tiles):
+            found = True
+            expert = e
+            rows_e = n_rows
+            group_size = GROUP_M * num_n
+            first_m = (tile // group_size) * GROUP_M
+            gsz = tl.minimum(n_m - first_m, GROUP_M)
+            m_tile = first_m + (tile % group_size) % gsz
+            n_tile = (tile % group_size) // gsz
+        if not found:
+            tile = tile - n_tiles
+            row_start = end
+    return found, expert, row_start, rows_e, m_tile, n_tile
+
+
+@triton.jit
+def _fp8_moe_gather_quant_kernel(X, TOK, X8, SC, AMAX, R,
+                                 D: tl.constexpr, BLOCK_R: tl.constexpr):
+    """x8[r] = e4m3(x[tok[r]] * scale_x): the expert-order gather fused with the
+    quantization."""
+    rr = tl.program_id(0) * BLOCK_R + tl.arange(0, BLOCK_R)
+    rd = tl.arange(0, D)
+    rmask = rr < R
+    m = rmask[:, None]
+    tok = tl.load(TOK + rr, mask=rmask, other=0)
+    x = tl.load(X + tok[:, None] * D + rd[None, :], mask=m, other=0.0).to(tl.float32)
+    x8 = tl.clamp(x * tl.load(SC), -448.0, 448.0).to(tl.float8e4nv)
+    tl.store(X8 + rr[:, None] * D + rd[None, :], x8, mask=m)
+    tl.atomic_max(AMAX, tl.max(tl.abs(x)))
+
+
+@triton.jit
+def _fp8_moe_swiglu_fwd_kernel(X8, W8, OFFS, SC, WS, GU8, H8, AMAX, K, I,
+                               E: tl.constexpr, BLOCK_M: tl.constexpr, BLOCK_N: tl.constexpr,
+                               BLOCK_K: tl.constexpr, GROUP_M: tl.constexpr):
+    """Per expert e: gu = x8 @ W8[e]^T (fp8 MMA); SwiGLU epilogue; gu, h stored e4m3."""
+    found, expert, row_start, rows_e, m_tile, n_tile = _expert_tile(
+        OFFS, tl.program_id(0), I, E, BLOCK_M, BLOCK_N, GROUP_M)
+    if not found:
+        return
+    lm = m_tile * BLOCK_M + tl.arange(0, BLOCK_M)
+    rn = n_tile * BLOCK_N + tl.arange(0, BLOCK_N)
+    rk = tl.arange(0, BLOCK_K)
+    m = (lm < rows_e)[:, None]
+    rows = row_start + lm
+    x_ptrs = X8 + rows[:, None] * K + rk[None, :]
+    wg_ptrs = W8 + expert * (2 * I * K) + rn[None, :] * K + rk[:, None]
+    wu_ptrs = wg_ptrs + I * K
+    acc_g = tl.zeros((BLOCK_M, BLOCK_N), dtype=tl.float32)
+    acc_u = tl.zeros((BLOCK_M, BLOCK_N), dtype=tl.float32)
+    for _ in range(0, K, BLOCK_K):
+        x = tl.load(x_ptrs, mask=m, other=0.0)
+        acc_g = tl.dot(x, tl.load(wg_ptrs), acc_g)
+        acc_u = tl.dot(x, tl.load(wu_ptrs), acc_u)
+        x_ptrs += BLOCK_K
+        wg_ptrs += BLOCK_K
+        wu_ptrs += BLOCK_K
+    deq = 1.0 / (tl.load(SC) * tl.load(WS + expert))
+    g = (acc_g * deq).to(tl.bfloat16).to(tl.float32)
+    u = (acc_u * deq).to(tl.bfloat16).to(tl.float32)
+    h = g * tl.sigmoid(g) * u
+    q_gu = tl.load(SC + 1)
+    q_h = tl.load(SC + 2)
+    gu_ptrs = GU8 + rows[:, None] * (2 * I) + rn[None, :]
+    tl.store(gu_ptrs, tl.clamp(g * q_gu, -448.0, 448.0).to(tl.float8e4nv), mask=m)
+    tl.store(gu_ptrs + I, tl.clamp(u * q_gu, -448.0, 448.0).to(tl.float8e4nv), mask=m)
+    tl.store(H8 + rows[:, None] * I + rn[None, :], tl.clamp(h * q_h, -448.0, 448.0).to(tl.float8e4nv), mask=m)
+    tl.atomic_max(AMAX + 1, tl.maximum(tl.max(tl.abs(g)), tl.max(tl.abs(u))))
+    tl.atomic_max(AMAX + 2, tl.max(tl.abs(h)))
+
+
+@triton.jit
+def _fp8_moe_down_fwd_kernel(H8, WD8, OFFS, SC, WSD, OUT, N, K,
+                             E: tl.constexpr, BLOCK_M: tl.constexpr, BLOCK_N: tl.constexpr,
+                             BLOCK_K: tl.constexpr, GROUP_M: tl.constexpr):
+    """Per expert e: out = h8 @ Wd8[e]^T (fp8 MMA), bf16 rows in expert order."""
+    found, expert, row_start, rows_e, m_tile, n_tile = _expert_tile(
+        OFFS, tl.program_id(0), N, E, BLOCK_M, BLOCK_N, GROUP_M)
+    if not found:
+        return
+    lm = m_tile * BLOCK_M + tl.arange(0, BLOCK_M)
+    rn = n_tile * BLOCK_N + tl.arange(0, BLOCK_N)
+    rk = tl.arange(0, BLOCK_K)
+    m = (lm < rows_e)[:, None]
+    rows = row_start + lm
+    a_ptrs = H8 + rows[:, None] * K + rk[None, :]
+    b_ptrs = WD8 + expert * (N * K) + rn[None, :] * K + rk[:, None]
+    acc = tl.zeros((BLOCK_M, BLOCK_N), dtype=tl.float32)
+    for _ in range(0, K, BLOCK_K):
+        acc = tl.dot(tl.load(a_ptrs, mask=m, other=0.0), tl.load(b_ptrs), acc)
+        a_ptrs += BLOCK_K
+        b_ptrs += BLOCK_K
+    acc = acc / (tl.load(SC + 2) * tl.load(WSD + expert))
+    tl.store(OUT + rows[:, None] * N + rn[None, :], acc.to(tl.bfloat16), mask=m)
+
+
+@triton.jit
+def _fp8_moe_down_dgrad_swiglu_kernel(DY, WD, GU8, DGU8, OFFS, SC, AMAX, K, I,
+                                      E: tl.constexpr, BLOCK_M: tl.constexpr,
+                                      BLOCK_N: tl.constexpr, BLOCK_K: tl.constexpr,
+                                      GROUP_M: tl.constexpr):
+    """Per expert e: dh = dy @ Wd[e] (bf16 MMA, never stored); SwiGLU backward in the
+    epilogue against the fp8 gu; d_gu written once in e5m2. Records dy's amax."""
+    found, expert, row_start, rows_e, m_tile, n_tile = _expert_tile(
+        OFFS, tl.program_id(0), I, E, BLOCK_M, BLOCK_N, GROUP_M)
+    if not found:
+        return
+    lm = m_tile * BLOCK_M + tl.arange(0, BLOCK_M)
+    rn = n_tile * BLOCK_N + tl.arange(0, BLOCK_N)
+    rk = tl.arange(0, BLOCK_K)
+    m = (lm < rows_e)[:, None]
+    rows = row_start + lm
+    a_ptrs = DY + rows[:, None] * K + rk[None, :]
+    b_ptrs = WD + expert * (K * I) + rk[:, None] * I + rn[None, :]
+    acc = tl.zeros((BLOCK_M, BLOCK_N), dtype=tl.float32)
+    dy_amax = 0.0
+    for _ in range(0, K, BLOCK_K):
+        dy = tl.load(a_ptrs, mask=m, other=0.0)
+        if n_tile == 0:
+            dy_amax = tl.maximum(dy_amax, tl.max(tl.abs(dy.to(tl.float32))))
+        acc = tl.dot(dy, tl.load(b_ptrs), acc)
+        a_ptrs += BLOCK_K
+        b_ptrs += BLOCK_K * I
+    if n_tile == 0:
+        tl.atomic_max(AMAX + 4, dy_amax)
+    dh = acc.to(tl.bfloat16).to(tl.float32)
+    s_gu = 1.0 / tl.load(SC + 1)
+    q = tl.load(SC + 3)
+    gu_ptrs = GU8 + rows[:, None] * (2 * I) + rn[None, :]
+    g = tl.load(gu_ptrs, mask=m, other=0.0).to(tl.float32) * s_gu
+    u = tl.load(gu_ptrs + I, mask=m, other=0.0).to(tl.float32) * s_gu
+    sig = tl.sigmoid(g)
+    d_gate = dh * u * (sig * (1.0 + g * (1.0 - sig)))
+    d_up = dh * g * sig
+    out_ptrs = DGU8 + rows[:, None] * (2 * I) + rn[None, :]
+    tl.store(out_ptrs, tl.clamp(d_gate * q, -57344.0, 57344.0).to(tl.float8e5), mask=m)
+    tl.store(out_ptrs + I, tl.clamp(d_up * q, -57344.0, 57344.0).to(tl.float8e5), mask=m)
+    tl.atomic_max(AMAX + 3, tl.maximum(tl.max(tl.abs(d_gate)), tl.max(tl.abs(d_up))))
+
+
+@triton.jit
+def _fp8_moe_dgrad_kernel(DGU8, W8T, OFFS, SC, WS, OUT, N, K,
+                          E: tl.constexpr, BLOCK_M: tl.constexpr, BLOCK_N: tl.constexpr,
+                          BLOCK_K: tl.constexpr, GROUP_M: tl.constexpr):
+    """Per expert e: dx = d_gu8 @ W8[e] (fp8 MMA); B read from W8^T (K-contiguous)."""
+    found, expert, row_start, rows_e, m_tile, n_tile = _expert_tile(
+        OFFS, tl.program_id(0), N, E, BLOCK_M, BLOCK_N, GROUP_M)
+    if not found:
+        return
+    lm = m_tile * BLOCK_M + tl.arange(0, BLOCK_M)
+    rn = n_tile * BLOCK_N + tl.arange(0, BLOCK_N)
+    rk = tl.arange(0, BLOCK_K)
+    m = (lm < rows_e)[:, None]
+    rows = row_start + lm
+    a_ptrs = DGU8 + rows[:, None] * K + rk[None, :]
+    b_ptrs = W8T + expert * (N * K) + rn[None, :] * K + rk[:, None]
+    acc = tl.zeros((BLOCK_M, BLOCK_N), dtype=tl.float32)
+    for _ in range(0, K, BLOCK_K):
+        acc = tl.dot(tl.load(a_ptrs, mask=m, other=0.0), tl.load(b_ptrs), acc)
+        a_ptrs += BLOCK_K
+        b_ptrs += BLOCK_K
+    acc = acc / (tl.load(SC + 3) * tl.load(WS + expert))
+    tl.store(OUT + rows[:, None] * N + rn[None, :], acc.to(tl.bfloat16), mask=m)
+
+
+@triton.jit
+def _fp8_moe_wgrad_kernel(A, B, OFFS, ORDER, OUT, SA, SB, MA, NB,
+                          BLOCK_M: tl.constexpr, BLOCK_N: tl.constexpr, BLOCK_K: tl.constexpr):
+    """OUT[e, m, n] = sum over expert e's rows r of A[r, m] B[r, n] / (SA * SB):
+    fp8 A (R, MA) read transposed, fp8 B (R, NB) row-major. A token-contiguous B
+    would suit the MMA better, but its row-boundary mask then varies inside each
+    contiguous group and the loads go scalar (3.3 vs 1.9 ms). Experts run in
+    ORDER (largest first) so the router's imbalance does not stretch the tail."""
+    pid = tl.program_id(0)
+    expert = tl.load(ORDER + tl.program_id(1))
+    num_n = tl.cdiv(NB, BLOCK_N)
+    rm = (pid // num_n) * BLOCK_M + tl.arange(0, BLOCK_M)
+    rn = (pid % num_n) * BLOCK_N + tl.arange(0, BLOCK_N)
+    rk = tl.arange(0, BLOCK_K)
+    row_start = 0
+    if expert > 0:
+        row_start = tl.load(OFFS + expert - 1)
+    row_end = tl.load(OFFS + expert)
+    qa = tl.load(SA)
+    acc = tl.zeros((BLOCK_M, BLOCK_N), dtype=tl.float32)
+    # start on a BLOCK_K boundary (masking the previous expert's rows) so the loads
+    # stay provably aligned
+    for r0 in range((row_start // BLOCK_K) * BLOCK_K, row_end, BLOCK_K):
+        kmask = ((r0 + rk) >= row_start) & ((r0 + rk) < row_end)
+        a = tl.load(A + (r0 + rk)[None, :] * MA + rm[:, None], mask=kmask[None, :], other=0.0)
+        b = tl.load(B + (r0 + rk)[:, None] * NB + rn[None, :], mask=kmask[:, None], other=0.0)
+        acc = tl.dot(a, b, acc)
+    tl.store(OUT + expert * (MA * NB) + rm[:, None] * NB + rn[None, :], acc / (qa * tl.load(SB)))
+
+
+@triton.jit
+def _expert_chunk(OFFS, cid, CH: tl.constexpr, E: tl.constexpr):
+    """Map a chunk id onto (expert, row range) with every expert's rows cut into
+    CH-row chunks (the grid is sized for cdiv(R, CH) + E chunks)."""
+    row_start = 0
+    found = False
+    expert = 0
+    rs = 0
+    re = 0
+    for e in tl.static_range(E):
+        end = tl.load(OFFS + e)
+        n = tl.cdiv(end - row_start, CH)
+        if (not found) and (cid < n):
+            found = True
+            expert = e
+            rs = row_start + cid * CH
+            re = tl.minimum(rs + CH, end)
+        if not found:
+            cid = cid - n
+            row_start = end
+    return found, expert, rs, re
+
+
+@triton.jit
+def _fp8_moe_wgrad_rows_kernel(A, B, OFFS, OUT, SA, SB, MA, NB,
+                               CH: tl.constexpr, E: tl.constexpr, BLOCK_R: tl.constexpr,
+                               BLOCK_M: tl.constexpr, BLOCK_N: tl.constexpr):
+    """OUT[e] += sum over one CH-row chunk of expert e of A[r, m] B[r, n] / (SA * SB)
+    (OUT zero-filled; fp32 atomic accumulation). Splitting experts into chunks keeps
+    the GPU busy when the router is unbalanced -- single layers routinely send
+    35-50% of their tokens to one expert. Row tiles load contiguously; the bf16 A
+    (dy) is quantized to e5m2 and transposed in registers."""
+    found, expert, rs, re = _expert_chunk(OFFS, tl.program_id(1), CH, E)
+    if not found:
+        return
+    pid = tl.program_id(0)
+    num_n = tl.cdiv(NB, BLOCK_N)
+    rm = (pid // num_n) * BLOCK_M + tl.arange(0, BLOCK_M)
+    rn = (pid % num_n) * BLOCK_N + tl.arange(0, BLOCK_N)
+    rr = tl.arange(0, BLOCK_R)
+    qa = tl.load(SA)
+    acc = tl.zeros((BLOCK_M, BLOCK_N), dtype=tl.float32)
+    for r0 in range((rs // BLOCK_R) * BLOCK_R, re, BLOCK_R):  # aligned start
+        rows = r0 + rr
+        rmask = ((rows >= rs) & (rows < re))[:, None]
+        a = tl.load(A + rows[:, None] * MA + rm[None, :], mask=rmask, other=0.0)
+        a = tl.clamp(a.to(tl.float32) * qa, -57344.0, 57344.0).to(tl.float8e5)
+        b = tl.load(B + rows[:, None] * NB + rn[None, :], mask=rmask, other=0.0)
+        acc = tl.dot(tl.trans(a), b, acc)
+    tl.atomic_add(OUT + expert * (MA * NB) + rm[:, None] * NB + rn[None, :],
+                  acc / (qa * tl.load(SB)), sem="relaxed")
+
+
+FP8_MOE_WGRAD_CHUNK = 4096
+
+
+def _fp8_quantize_experts(w: torch.Tensor):
+    """Per-expert e4m3 copies of (E, out, in) fp32 master weights (pow2 scales)."""
+    amax = w.detach().abs().amax(dim=(1, 2)).clamp(min=1e-30)
+    q = torch.exp2(torch.floor(torch.log2(448.0 / amax)))
+    return (w.detach() * q[:, None, None]).clamp(-448.0, 448.0).to(torch.float8_e4m3fn), q
+
+
+class _FP8Experts(torch.autograd.Function):
+    """Grouped expert SwiGLU MLP with fp8 storage, the MoE twin of _FP8MLPBlock:
+    the expert-order gather is fused with the e4m3 quantization of x; gu, h (e4m3)
+    and d_gu (e5m2) are the only stored activations; expert weights get per-expert
+    e4m3 copies (fp32 masters, fp32 grads). Returns unweighted bf16 expert rows in
+    expert order (the router-weighted top-k combine stays bf16)."""
+
+    @staticmethod
+    def forward(ctx, x, w_gu, w_d, token_index, inverse_permutation, offsets, top_k,
+                scale, amax):
+        T_, D = x.shape
+        E, twoI, _ = w_gu.shape
+        I = twoI // 2
+        R = token_index.numel()
+        dev = x.device
+        x8 = torch.empty(R, D, device=dev, dtype=torch.float8_e4m3fn)
+        _fp8_moe_gather_quant_kernel[(triton.cdiv(R, 32),)](
+            x, token_index, x8, scale, amax, R, D=D, BLOCK_R=32, num_warps=8)
+        w8, q_gu = _fp8_quantize_experts(w_gu)
+        wd8, q_d = _fp8_quantize_experts(w_d)
+        gu8 = torch.empty(R, twoI, device=dev, dtype=torch.float8_e4m3fn)
+        h8 = torch.empty(R, I, device=dev, dtype=torch.float8_e4m3fn)
+        _fp8_moe_swiglu_fwd_kernel[((triton.cdiv(R, 128) + E) * (I // 64),)](
+            x8, w8, offsets, scale, q_gu, gu8, h8, amax, D, I,
+            E=E, BLOCK_M=128, BLOCK_N=64, BLOCK_K=64, GROUP_M=8, num_warps=4, num_stages=4)
+        out = torch.empty(R, D, device=dev, dtype=torch.bfloat16)
+        _fp8_moe_down_fwd_kernel[((triton.cdiv(R, 64) + E) * (D // 64),)](
+            h8, wd8, offsets, scale, q_d, out, D, I,
+            E=E, BLOCK_M=64, BLOCK_N=64, BLOCK_K=128, GROUP_M=8, num_warps=4, num_stages=3)
+        ctx.save_for_backward(x8, w8.transpose(1, 2).contiguous(), q_gu,
+                              w_d.to(torch.bfloat16), gu8, h8, offsets,
+                              inverse_permutation, scale, amax)
+        ctx.shape = (T_, top_k)
+        return out
+
+    @staticmethod
+    def backward(ctx, dout):
+        x8, w8t, q_gu, wd, gu8, h8, offsets, inverse_permutation, scale, amax = ctx.saved_tensors
+        T_, top_k = ctx.shape
+        dout = dout.contiguous()
+        R, D = dout.shape
+        E, _, I = wd.shape
+        dev = dout.device
+        dgu8 = torch.empty(R, 2 * I, device=dev, dtype=torch.float8_e5m2)
+        _fp8_moe_down_dgrad_swiglu_kernel[((triton.cdiv(R, 64) + E) * (I // 64),)](
+            dout, wd, gu8, dgu8, offsets, scale, amax, D, I,
+            E=E, BLOCK_M=64, BLOCK_N=64, BLOCK_K=32, GROUP_M=8, num_warps=4, num_stages=4)
+        dx = torch.empty(R, D, device=dev, dtype=torch.bfloat16)
+        _fp8_moe_dgrad_kernel[((triton.cdiv(R, 128) + E) * (D // 128),)](
+            dgu8, w8t, offsets, scale, q_gu, dx, D, 2 * I,
+            E=E, BLOCK_M=128, BLOCK_N=128, BLOCK_K=64, GROUP_M=8, num_warps=4, num_stages=4)
+        counts = torch.diff(offsets, prepend=offsets.new_zeros(1))
+        order = torch.argsort(counts, descending=True).to(torch.int32)  # largest expert first
+        dw_gu = torch.empty(E, 2 * I, D, device=dev, dtype=torch.float32)
+        _fp8_moe_wgrad_kernel[((2 * I) // 128 * (D // 128), E)](
+            dgu8, x8, offsets, order, dw_gu, scale[3:], scale[0:], 2 * I, D,
+            BLOCK_M=128, BLOCK_N=128, BLOCK_K=64, num_warps=4, num_stages=3)
+        dw_d = torch.zeros(E, D, I, device=dev, dtype=torch.float32)
+        _fp8_moe_wgrad_rows_kernel[(D // 128 * (I // 128), triton.cdiv(R, FP8_MOE_WGRAD_CHUNK) + E)](
+            dout, h8, offsets, dw_d, scale[4:], scale[2:], D, I, CH=FP8_MOE_WGRAD_CHUNK, E=E,
+            BLOCK_R=32, BLOCK_M=128, BLOCK_N=128, num_warps=4, num_stages=3)
+        dxn = _sum_topk_rows(dx, inverse_permutation, top_k)
+        return dxn, dw_gu, dw_d, None, None, None, None, None, None
 
 
 # --------------------------------------------------------------------------- #
@@ -1354,6 +1707,9 @@ class Experts(nn.Module):
         self.down_proj = nn.Parameter(torch.empty(
             self.num_experts, self.hidden_dim, self.intermediate_dim
         ))
+        # fp8 expert state (see _FP8Experts); per-rank, not checkpointed
+        self.register_buffer("fp8_scale", torch.ones(5), persistent=False)
+        self.register_buffer("fp8_amax", torch.zeros(5), persistent=False)
 
     def forward(
         self,
@@ -1372,9 +1728,6 @@ class Experts(nn.Module):
         inverse_permutation[permutation] = torch.arange(
             permutation.numel(), device=permutation.device
         )
-        sorted_hidden = _GatherTopK.apply(
-            hidden_states, sorted_token_indices, inverse_permutation, top_k
-        )
         sorted_weights = flat_weights[permutation]
         histc_input = (
             sorted_experts.int() if hidden_states.is_cuda
@@ -1388,6 +1741,18 @@ class Experts(nn.Module):
         )
         offsets = torch.cumsum(tokens_per_expert, dim=0, dtype=torch.int32)
 
+        if _use_fp8_moe(self, hidden_states):
+            expert_output = _FP8Experts.apply(
+                hidden_states, self.gate_up_proj, self.down_proj, sorted_token_indices,
+                inverse_permutation, offsets, top_k, self.fp8_scale, self.fp8_amax,
+            )
+            return _CombineTopK.apply(
+                expert_output, sorted_weights, inverse_permutation,
+                sorted_token_indices, top_k,
+            ).to(dtype=hidden_states.dtype)
+        sorted_hidden = _GatherTopK.apply(
+            hidden_states, sorted_token_indices, inverse_permutation, top_k
+        )
         if _use_fused_swiglu(sorted_hidden):
             expert_hidden = _FusedSwiGLU.apply(
                 sorted_hidden, self.gate_up_proj.to(dtype=sorted_hidden.dtype), offsets
@@ -2452,9 +2817,10 @@ def parse_args() -> argparse.Namespace:
                    help="Triton grouped GEMM with the SwiGLU fused into its epilogue for "
                         "the dense MLP and the MoE experts (see _FusedSwiGLU)")
     p.add_argument("--fp8-mlp", action=argparse.BooleanOptionalAction, default=False,
-                   help="dense MLP sub-blocks store activations and activation grads in fp8 "
-                        "with fp8 GEMMs while training (delayed per-tensor scaling; see "
-                        "_FP8MLPBlock). Changes numerics; validation stays bf16")
+                   help="dense MLP sub-blocks and MoE experts store activations and "
+                        "activation grads in fp8 with fp8 GEMMs while training (delayed "
+                        "per-tensor scaling; see _FP8MLPBlock / _FP8Experts). Changes "
+                        "numerics; validation stays bf16")
     p.add_argument("--fused-qk-rope", action=argparse.BooleanOptionalAction, default=True,
                    help="one Triton pass each way for q/k RMSNorm + RoPE around "
                         "flash-attn (see _QKNormRoPEAttention)")

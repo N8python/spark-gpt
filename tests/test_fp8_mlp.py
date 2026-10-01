@@ -53,6 +53,62 @@ class FP8MLPBlockTest(unittest.TestCase):
             self.assertLess(err, 0.12, f"{name}: rel err {err:.3e}")
 
 
+class FP8ExpertsTest(unittest.TestCase):
+    def test_fp8_experts_track_fp32_reference(self):
+        if train.triton is None or not torch.cuda.is_available():
+            self.skipTest("CUDA + triton are required")
+        torch.manual_seed(0)
+        config = train.ModelConfig(
+            vocab_size=train.VOCAB_SIZE, hidden_size=256, num_hidden_layers=1,
+            intermediate_size=768, num_attention_heads=2, num_key_value_heads=1,
+            head_dim=128, max_position_embeddings=512, num_experts=4,
+            num_experts_per_tok=2, moe_intermediate_size=128,
+        )
+        experts = train.Experts(config).cuda().train()
+        with torch.no_grad():
+            experts.gate_up_proj.normal_(0, 0.05)
+            experts.down_proj.normal_(0, 0.05)
+        T, k = 500, 2
+        x = torch.randn(T, 256, device="cuda").to(torch.bfloat16)
+        # expert 2 gets no tokens; each token picks two distinct experts from {0, 1, 3}
+        choices = torch.tensor([[0, 1], [1, 3], [0, 3]], device="cuda")
+        selected = choices[torch.randint(0, 3, (T,), device="cuda")]
+        weights = torch.softmax(torch.randn(T, k, device="cuda"), -1).to(torch.bfloat16)
+        probe = torch.randn(T, 256, device="cuda")
+        saved = train.FP8_MLP
+        train.FP8_MLP = True
+        try:
+            def fp8_step():
+                xx = x.clone().requires_grad_(True)
+                out = experts(xx, selected, weights)
+                g = torch.autograd.grad((out.float() * probe).sum(),
+                                        [xx, experts.gate_up_proj, experts.down_proj])
+                return (out,) + g
+            fp8_step()
+            self.assertTrue(bool((experts.fp8_amax > 0).all()), experts.fp8_amax)
+            train.fp8_update_scales(experts)
+            out = fp8_step()
+        finally:
+            train.FP8_MLP = saved
+
+        x32 = x.float().requires_grad_(True)
+        wgu = experts.gate_up_proj.detach().float().requires_grad_(True)
+        wd = experts.down_proj.detach().float().requires_grad_(True)
+        y32 = torch.zeros(T, 256, device="cuda")
+        for s in range(k):
+            e = selected[:, s]
+            g, u = torch.einsum("td,tod->to", x32, wgu[e]).chunk(2, dim=-1)
+            y32 = y32 + weights[:, s, None].float() * torch.einsum(
+                "ti,tdi->td", F.silu(g) * u, wd[e])
+        ref = (y32,) + torch.autograd.grad((y32 * probe).sum(), [x32, wgu, wd])
+        for name, a_, r in zip(("out", "dx", "dW_gate_up", "dW_down"), out, ref):
+            err = ((a_.float() - r).norm() / r.norm()).item()
+            self.assertTrue(torch.isfinite(a_).all(), name)
+            self.assertLess(err, 0.12, f"{name}: rel err {err:.3e}")
+        torch.testing.assert_close(out[2][2], torch.zeros_like(out[2][2]))  # unused expert
+        torch.testing.assert_close(out[3][2], torch.zeros_like(out[3][2]))
+
+
 class FP8GuardTest(unittest.TestCase):
     def test_moe_model_trains_with_and_without_fp8_flag(self):
         # regression: the fp8 guard must not touch sparse blocks' (absent) down_proj

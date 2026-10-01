@@ -1,5 +1,54 @@
 # Changes
 
+## 2026-10-01 — `--fp8-mlp` extends to MoE experts
+
+`_FP8Experts` is the MoE twin of `_FP8MLPBlock`: the same fp8 storage
+(`x`, `gu`, `h` e4m3; `d_gu` e5m2), delayed per-tensor scales and epilogue
+placement of the SwiGLU backward, as grouped kernels whose programs find their
+expert from the routing offsets. The gather into expert order is fused with the
+e4m3 quantization of `x`; expert weights get per-expert e4m3 copies (fp32
+masters and gradients). The router, the sort and the router-weighted top-k
+combine stay bf16, so routing decisions never see fp8 noise. Same flag:
+`--fp8-mlp` now covers dense MLPs and experts.
+
+Grouped-specific findings:
+
+- An arbitrary per-expert `row_start` makes token-contiguous loads unprovably
+  aligned, and a row-boundary mask that varies inside a contiguous group
+  forces scalar loads: the first gate_up weight-gradient kernel took 17.6 ms.
+  Loops now start on a block boundary and the weight gradient reads `x` row
+  major (1.9 ms).
+- Single layers are routinely very unbalanced (one captured layer sent 49% and
+  35% of its tokens to two experts; the logged router stats average this
+  away). The down-proj weight gradient therefore splits every expert into
+  4,096-row chunks accumulated with fp32 atomics (1.79 -> 1.37 ms on that
+  layer) -- its summation order, like flash-attn's backward, is not
+  run-to-run deterministic. DDP ranks still agree bit for bit (the gradients
+  are all-reduced).
+- `torch._scaled_grouped_mm` is limited to sm_90/sm_100, so the grouped dgrad
+  stays in Triton (1.5 ms vs cuBLAS's 1.0 ms for the dense equivalent); that
+  and the routing/combine and Muon cost of 164M parameters, which fp8 does not
+  touch, are why MoE gains less than dense.
+
+| MoE 8x2 | `143fab2` (bf16) | `--fp8-mlp` | |
+| --- | ---: | ---: | ---: |
+| steady window tok/s | 80.0k-80.4k (612-614 ms/step) | **87.8k-88.1k (558-560 ms/step)** | +9.6% |
+| peak alloc | 18.10 GiB | 13.78 GiB | -24% |
+
+Quality, the 4,100-step parity protocol on the MoE default (held-out loss):
+
+| step | 410 | 820 | 1230 | 1640 | 2050 | 2460 | 2870 | 3280 | 3690 | 4100 |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
+| bf16 | 1.2929 | 1.0735 | 1.0053 | 0.9629 | 0.9322 | 0.9069 | 0.8865 | 0.8710 | 0.8598 | 0.8529 |
+| `--fp8-mlp` | 1.2869 | 1.0726 | 1.0031 | 0.9609 | 0.9298 | 0.9051 | 0.8846 | 0.8693 | 0.8581 | 0.8514 |
+
+Ahead at every checkpoint, as with dense; router healthy (no unused experts).
+Dense `--fp8-mlp` throughput is unchanged (121.1k-121.3k).
+
+Also fixed (`143fab2`): the fp8 guard read `block.mlp.down_proj` before
+checking `is_sparse`, which crashed every MoE model with or without the flag;
+a regression test now trains a mixed dense/MoE model with the flag off and on.
+
 ## 2026-10-01 — `--fp8-mlp`: fp8-storage dense MLP (opt-in)
 
 At dim 512 the MLP kernels are bandwidth-bound on their activations, not
@@ -41,8 +90,7 @@ GB10 (alice, bob):
 | dense 50M, 2 nodes | 204k aggregate | **232k aggregate** (1.91x) | +13.7% |
 | peak alloc 50M / 0.6B | 13.96 / 63.2 GiB | 10.26 / 49.8 GiB | |
 
-The MoE default is unaffected (its MLPs are all sparse; `--mlp-only-layers`
-dense layers do take the fp8 path).
+(MoE experts gained the fp8 path in the next entry.)
 
 Quality, same 4,100-step parity protocol as the 2026-09-30 entry
 (held-out loss; `b9f2292` bf16 vs this tree):
