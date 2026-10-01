@@ -1,5 +1,68 @@
 # Changes
 
+## 2026-10-01 — `--fp8-mlp`: fp8-storage dense MLP (opt-in)
+
+At dim 512 the MLP kernels are bandwidth-bound on their activations, not
+their weights (a weight is ~3 MB; `gu`, `h` and their gradients are
+75-450 MB per layer), so fp8 pays only if the *activations* and *activation
+gradients* live in fp8 end to end. `_FP8MLPBlock` replaces the whole
+post-attention sub-block (RMSNorm -> SwiGLU MLP -> residual):
+
+- forward: RMSNorm writes `x` straight to e4m3 (row-major for the GEMM, plus
+  a token-contiguous copy for the weight gradient); the fused SwiGLU GEMM
+  (fp8 MMA) writes `gu` and `h` in e4m3; the down projection (fp8 MMA) adds
+  the residual in its epilogue.
+- backward: the down-proj dgrad runs the SwiGLU backward in its epilogue and
+  writes `d_gu` once, in e5m2 (`dh` is never stored; with fp8 storage this is
+  cheaper than the bf16 design's recompute-in-every-consumer); gate_up dgrad is
+  a cuBLAS fp8 GEMM (`_scaled_mm`), gate_up and down wgrad are Triton fp8
+  GEMMs (the down wgrad quantizes `dy` to e5m2 in registers); one kernel does
+  the RMSNorm backward + residual gradient.
+- scaling: delayed per-tensor power-of-two scales with one binade of
+  headroom; kernels record each tensor's amax with atomics and the trainer
+  rolls them into the next step's scales after the prewarm step and every
+  optimizer step. Master weights stay fp32 (an e4m3 copy per call); weight and
+  norm-weight gradients are fp32. Validation and export use the bf16 path.
+
+fp8 MMA on GB10 wants both operands contiguous along the reduction: the
+gate_up dgrad takes a transposed copy of the (tiny) fp8 weight, the wgrad a
+transposed copy of fp8 `x` written by the norm kernel. Block-scaled MXFP8
+(`tl.dot_scaled`) is slower than bf16 on sm_121 in Triton 3.7 (emulated), so
+the scaling is per tensor.
+
+Throughput, same protocol as below (5M tokens, 104 steps, seed 0, steady
+window over the second half, fresh compile per run), one run per tree on each
+GB10 (alice, bob):
+
+| | `b9f2292` (bf16) | `--fp8-mlp` | |
+| --- | ---: | ---: | ---: |
+| dense 50M | 106.4k-106.7k (461 ms/step) | **121.2k (405 ms/step)** | +13.7% |
+| dense 0.6B | 15.3k-15.5k | **17.4k-17.7k** | +14% |
+| dense 50M, 2 nodes | 204k aggregate | **232k aggregate** (1.91x) | +13.7% |
+| peak alloc 50M / 0.6B | 13.96 / 63.2 GiB | 10.26 / 49.8 GiB | |
+
+The MoE default is unaffected (its MLPs are all sparse; `--mlp-only-layers`
+dense layers do take the fp8 path).
+
+Quality, same 4,100-step parity protocol as the 2026-09-30 entry
+(held-out loss; `b9f2292` bf16 vs this tree):
+
+| step | 410 | 820 | 1230 | 1640 | 2050 | 2460 | 2870 | 3280 | 3690 | 4100 |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
+| bf16 | 1.3692 | 1.0989 | 1.0297 | 0.9878 | 0.9573 | 0.9332 | 0.9137 | 0.8986 | 0.8876 | 0.8810 |
+| fp8 fake-quant (just-in-time scales) | 1.3604 | 1.0966 | 1.0266 | 0.9855 | 0.9551 | 0.9315 | 0.9120 | 0.8971 | 0.8862 | 0.8799 |
+| `--fp8-mlp` | 1.3396 | 1.0897 | 1.0234 | 0.9824 | 0.9523 | 0.9286 | 0.9087 | 0.8933 | 0.8824 | 0.8762 |
+
+`--fp8-mlp` is ahead at every checkpoint. Not a precision effect (the real
+kernels are more precise than the fake-quant emulation in several places):
+a saturation count shows the forward tensors never clip, while early-training
+gradient spikes in `d_gu` and `dy` do (steps 1-199: ~0.3-0.8 clipped
+layer-tensors per step, up to 4.7x over range; rare after step 200) — delayed
+scaling acts as elementwise gradient clipping where training is spikiest.
+`FP8_HEADROOM_BINADES` trades that off. The flag stays opt-in because it
+changes numerics; per-element error vs fp32 is 5-8% on every MLP output and
+gradient.
+
 ## 2026-09-30 — fused q/k norm + RoPE, SwiGLU backward tiles
 
 Kernel-level trace of the compiled 50M step (489 ms, no idle gaps): GEMMs

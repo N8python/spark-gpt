@@ -592,11 +592,13 @@ def _fp8_down_dgrad_swiglu_kernel(DY, WD, GU8, DGU8, SC, AMAX, T, K, I,
     dy_amax = 0.0
     for _ in range(0, K, BLOCK_K):
         dy = tl.load(a_ptrs, mask=m, other=0.0)
-        dy_amax = tl.maximum(dy_amax, tl.max(tl.abs(dy.to(tl.float32))))
+        if n_tile == 0:  # every n tile reads the same dy rows; one column records the amax
+            dy_amax = tl.maximum(dy_amax, tl.max(tl.abs(dy.to(tl.float32))))
         acc = tl.dot(dy, tl.load(b_ptrs), acc)
         a_ptrs += BLOCK_K
         b_ptrs += BLOCK_K * I
-    tl.atomic_max(AMAX + 4, dy_amax)
+    if n_tile == 0:
+        tl.atomic_max(AMAX + 4, dy_amax)
     dh = acc.to(tl.bfloat16).to(tl.float32)
     s_gu = 1.0 / tl.load(SC + 1)
     q = tl.load(SC + 3)
@@ -751,13 +753,12 @@ class _FP8MLPBlock(torch.autograd.Function):
         I = wd.shape[1]
         dev = h.device
         dgu8 = torch.empty(T_, 2 * I, device=dev, dtype=torch.float8_e5m2)
-        _fp8_down_dgrad_swiglu_kernel[(triton.cdiv(T_, 64) * (I // 128),)](
+        _fp8_down_dgrad_swiglu_kernel[(triton.cdiv(T_, 64) * (I // 64),)](
             dy, wd, gu8, dgu8, scale, amax, T_, D, I,
-            BLOCK_M=64, BLOCK_N=128, BLOCK_K=32, GROUP_M=8, num_warps=8, num_stages=4)
-        dxn = torch.empty(T_, D, device=dev, dtype=torch.bfloat16)
-        _fp8_mm_kernel[(triton.cdiv(T_, 128) * (D // 128),)](
-            dgu8, w8t, dxn, scale[3:], wscale[0:], T_, D, 2 * I, 2 * I, 1, 1, 2 * I,
-            BLOCK_M=128, BLOCK_N=128, BLOCK_K=64, GROUP_M=8, num_warps=4, num_stages=3)
+            BLOCK_M=64, BLOCK_N=64, BLOCK_K=32, GROUP_M=8, num_warps=4, num_stages=4)
+        # plain fp8 GEMM, no epilogue: cuBLAS beats the Triton kernel here (1.07 vs 1.42 ms)
+        dxn = torch._scaled_mm(dgu8, w8t.t(), scale_a=1.0 / scale[3], scale_b=1.0 / wscale[0],
+                               out_dtype=torch.bfloat16, use_fast_accum=False)
         dh = torch.empty_like(h)
         n_prog = triton.cdiv(T_, FP8_NORM_BLOCK_T)
         dnw = torch.empty(n_prog, D, device=dev, dtype=torch.float32)
