@@ -53,7 +53,18 @@ Quality, same 4,100-step parity protocol as the 2026-09-30 entry
 | fp8 fake-quant (just-in-time scales) | 1.3604 | 1.0966 | 1.0266 | 0.9855 | 0.9551 | 0.9315 | 0.9120 | 0.8971 | 0.8862 | 0.8799 |
 | `--fp8-mlp` | 1.3396 | 1.0897 | 1.0234 | 0.9824 | 0.9523 | 0.9286 | 0.9087 | 0.8933 | 0.8824 | 0.8762 |
 
-`--fp8-mlp` is ahead at every checkpoint. Not a precision effect (the real
+Full matched 1B-token run (the canonical 50M recipe, held-out val every 5%,
+`b9f2292` on bob vs `--fp8-mlp` on alice): final val **0.7706 vs 0.7723**,
+fp8 ahead at 19 of 20 checkpoints (behind only at 5%: 1.0743 vs 1.0721), in
+**2.33 h vs 2.65 h** of training (115.8k vs 102.0k real tok/s including
+validation).
+
+| % of run | 5 | 10 | 25 | 50 | 75 | 90 | 100 |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
+| `b9f2292` val | 1.0721 | 0.9729 | 0.8839 | 0.8229 | 0.7880 | 0.7763 | 0.7723 |
+| `--fp8-mlp` val | 1.0743 | 0.9725 | 0.8822 | 0.8213 | 0.7868 | 0.7748 | 0.7706 |
+
+On the 4,100-step parity run `--fp8-mlp` is ahead at every checkpoint. Not a precision effect (the real
 kernels are more precise than the fake-quant emulation in several places):
 a saturation count shows the forward tensors never clip, while early-training
 gradient spikes in `d_gu` and `dy` do (steps 1-199: ~0.3-0.8 clipped

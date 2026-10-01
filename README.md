@@ -216,8 +216,8 @@ Dense MLP sub-blocks can keep their activations and activation gradients in
 fp8 (e4m3 / e5m2, delayed per-tensor scaling, fp32 master weights, bf16
 validation): 50M 106.7k -> 121.2k tok/s (+13.7%), 0.6B 15.4k -> 17.5k (+14%),
 2 nodes 232k aggregate, and ~25% less peak memory. It changes numerics, so it
-is off by default; on a matched 4,100-step run it was ahead of bf16 on held-out
-loss at every checkpoint (0.8762 vs 0.8810). Details in
+is off by default; on a matched full 1B-token run it ended ahead of bf16 on
+held-out loss (0.7706 vs 0.7723) in 12% less training time. Details in
 [CHANGES.md](CHANGES.md).
 
 ## License
