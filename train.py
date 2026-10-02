@@ -1621,15 +1621,19 @@ def _use_fused_swiglu(x: torch.Tensor) -> bool:
 
 @triton.jit
 def _swiglu_gemm_kernel(
-    X, W, OFFS, GU, H,
+    X, W, OFFS, GU, H, RSTD,
     K, I,
     stride_xr, stride_xk,
     stride_we, stride_wn, stride_wk,
     stride_gur, stride_gun,
     stride_hr, stride_hn,
     E: tl.constexpr, BLOCK_M: tl.constexpr, BLOCK_N: tl.constexpr, BLOCK_K: tl.constexpr,
-    GROUP_M: tl.constexpr, WRITE_GU: tl.constexpr,
+    GROUP_M: tl.constexpr, WRITE_GU: tl.constexpr, NORM: tl.constexpr, EPS: tl.constexpr,
 ):
+    """gate_up = x @ W_e^T per group, SwiGLU in the epilogue. With NORM, x is the
+    raw input of an RMSNorm whose weight is folded into W: the row sum of squares
+    accumulates from the x tiles the MMA reads and gate_up is scaled by rstd
+    before rounding (rstd stored to RSTD by the n_tile == 0 programs)."""
     pid = tl.program_id(0)
     num_n = tl.cdiv(I, BLOCK_N)
     # ---- locate this program's (expert, m tile, n tile) ----------------
@@ -1674,10 +1678,14 @@ def _swiglu_gemm_kernel(
     wu_ptrs = W + expert * stride_we + (rn + I)[None, :] * stride_wn + rk[:, None] * stride_wk
     acc_g = tl.zeros((BLOCK_M, BLOCK_N), dtype=tl.float32)
     acc_u = tl.zeros((BLOCK_M, BLOCK_N), dtype=tl.float32)
+    ss = tl.zeros((BLOCK_M,), dtype=tl.float32)
     n_mask = rn < I
     for k0 in range(0, K, BLOCK_K):
         k_mask = (k0 + rk) < K
         x = tl.load(x_ptrs, mask=row_mask[:, None] & k_mask[None, :], other=0.0)
+        if NORM:
+            xf = x.to(tl.float32)
+            ss += tl.sum(xf * xf, 1)
         wg = tl.load(wg_ptrs, mask=k_mask[:, None] & n_mask[None, :], other=0.0)
         wu = tl.load(wu_ptrs, mask=k_mask[:, None] & n_mask[None, :], other=0.0)
         acc_g = tl.dot(x, wg, acc_g)
@@ -1686,10 +1694,16 @@ def _swiglu_gemm_kernel(
         wg_ptrs += BLOCK_K * stride_wk
         wu_ptrs += BLOCK_K * stride_wk
     # ---- epilogue --------------------------------------------------------
+    rows = row_start + rm
+    if NORM:
+        r = tl.rsqrt(ss / K + EPS)
+        acc_g = acc_g * r[:, None]
+        acc_u = acc_u * r[:, None]
+        if n_tile == 0:
+            tl.store(RSTD + rows, r, mask=row_mask)
     g16 = acc_g.to(tl.bfloat16)
     u16 = acc_u.to(tl.bfloat16)
     out_mask = row_mask[:, None] & n_mask[None, :]
-    rows = row_start + rm
     if WRITE_GU:
         tl.store(GU + rows[:, None] * stride_gur + rn[None, :] * stride_gun, g16, mask=out_mask)
         tl.store(GU + rows[:, None] * stride_gur + (rn + I)[None, :] * stride_gun, u16, mask=out_mask)
@@ -1699,9 +1713,11 @@ def _swiglu_gemm_kernel(
     tl.store(H + rows[:, None] * stride_hr + rn[None, :] * stride_hn, h.to(tl.bfloat16), mask=out_mask)
 
 
-def _swiglu_gemm(x, w, offs, *, write_gu=True, BLOCK_M=64, BLOCK_N=64, BLOCK_K=32,
-                GROUP_M=8, num_warps=4, num_stages=3):
-    """x (R, K) bf16 sorted by group, w (E, 2I, K) bf16, offs (E,) int32 -> (gu, h)."""
+def _swiglu_gemm(x, w, offs, *, write_gu=True, rstd=None, eps=0.0, BLOCK_M=64, BLOCK_N=64,
+                 BLOCK_K=32, GROUP_M=8, num_warps=4, num_stages=3):
+    """x (R, K) bf16 sorted by group, w (E, 2I, K) bf16, offs (E,) int32 -> (gu, h).
+    With rstd (R,) fp32, x is RMSNorm'd on the fly (weight folded into w) and the
+    kernel fills rstd."""
     R, K = x.shape
     E, twoI, _ = w.shape
     I = twoI // 2
@@ -1709,14 +1725,15 @@ def _swiglu_gemm(x, w, offs, *, write_gu=True, BLOCK_M=64, BLOCK_N=64, BLOCK_K=3
     h = torch.empty(R, I, device=x.device, dtype=x.dtype)
     max_tiles = (triton.cdiv(R, BLOCK_M) + E) * triton.cdiv(I, BLOCK_N)
     _swiglu_gemm_kernel[(max_tiles,)](
-        x, w, offs, gu if write_gu else h, h,
+        x, w, offs, gu if write_gu else h, h, h if rstd is None else rstd,
         K, I,
         x.stride(0), x.stride(1),
         w.stride(0), w.stride(1), w.stride(2),
         gu.stride(0) if write_gu else 0, gu.stride(1) if write_gu else 0,
         h.stride(0), h.stride(1),
         E=E, BLOCK_M=BLOCK_M, BLOCK_N=BLOCK_N, BLOCK_K=BLOCK_K, GROUP_M=GROUP_M,
-        WRITE_GU=write_gu, num_warps=num_warps, num_stages=num_stages,
+        WRITE_GU=write_gu, NORM=rstd is not None, EPS=eps,
+        num_warps=num_warps, num_stages=num_stages,
     )
     return gu, h
 
@@ -1886,12 +1903,13 @@ def _swiglu_tiles(g, u, dh):
 
 @triton.jit
 def _swiglu_dgrad_kernel(
-    GU, DH, W, OFFS, OUT, I, N,
+    GU, DH, W, OFFS, OUT, RS, I, N,
     stride_gur, stride_dhr, stride_we, stride_wk, stride_wn, stride_or,
     E: tl.constexpr, BLOCK_M: tl.constexpr, BLOCK_N: tl.constexpr, BLOCK_K: tl.constexpr,
-    GROUP_M: tl.constexpr,
+    GROUP_M: tl.constexpr, SCALE_ROWS: tl.constexpr,
 ):
-    """OUT[r, n] = sum_k d_gu[r, k] * W[e, k, n], d_gu computed from GU/DH tiles."""
+    """OUT[r, n] = sum_k d_gu[r, k] * W[e, k, n], d_gu computed from GU/DH tiles
+    (with SCALE_ROWS, from DH[r] * RS[r]: d_gu is linear in dh)."""
     pid = tl.program_id(0)
     num_n = tl.cdiv(N, BLOCK_N)
     tile = pid
@@ -1927,6 +1945,8 @@ def _swiglu_dgrad_kernel(
     row_mask = rm < rows_e
     n_mask = rn < N
     rows = row_start + rm
+    if SCALE_ROWS:
+        rs = tl.load(RS + rows, mask=row_mask, other=0.0)[:, None]
     g_ptrs = GU + rows[:, None] * stride_gur + rk[None, :]
     u_ptrs = g_ptrs + I
     dh_ptrs = DH + rows[:, None] * stride_dhr + rk[None, :]
@@ -1939,6 +1959,8 @@ def _swiglu_dgrad_kernel(
         g = tl.load(g_ptrs, mask=m, other=0.0).to(tl.float32)
         u = tl.load(u_ptrs, mask=m, other=0.0).to(tl.float32)
         dh = tl.load(dh_ptrs, mask=m, other=0.0).to(tl.float32)
+        if SCALE_ROWS:
+            dh = dh * rs
         d_gate, d_up = _swiglu_tiles(g, u, dh)
         wm = k_mask[:, None] & n_mask[None, :]
         wg = tl.load(wg_ptrs, mask=wm, other=0.0)
@@ -1956,9 +1978,10 @@ def _swiglu_dgrad_kernel(
 
 @triton.jit
 def _swiglu_wgrad_kernel(
-    GU, DH, X, OFFS, OUT, I, K,
+    GU, DH, X, OFFS, OUT, RS, I, K,
     stride_gur, stride_dhr, stride_xr, stride_oe, stride_on, stride_ok,
     E: tl.constexpr, BLOCK_R: tl.constexpr, BLOCK_N: tl.constexpr, BLOCK_K: tl.constexpr,
+    SCALE_ROWS: tl.constexpr,
 ):
     """OUT[e, n, k] and OUT[e, I + n, k] = sum_r d_gate[r, n] x[r, k], d_up[r, n] x[r, k]."""
     pid = tl.program_id(0)
@@ -1987,6 +2010,8 @@ def _swiglu_wgrad_kernel(
         g = tl.load(GU + g_off, mask=m, other=0.0).to(tl.float32)
         u = tl.load(GU + g_off + I, mask=m, other=0.0).to(tl.float32)
         dh = tl.load(DH + rows[:, None] * stride_dhr + rn[None, :], mask=m, other=0.0).to(tl.float32)
+        if SCALE_ROWS:
+            dh = dh * tl.load(RS + rows, mask=r_mask, other=0.0)[:, None]
         d_gate, d_up = _swiglu_tiles(g, u, dh)
         x = tl.load(X + rows[:, None] * stride_xr + rk[None, :],
                     mask=r_mask[:, None] & k_mask[None, :], other=0.0)
@@ -1998,7 +2023,8 @@ def _swiglu_wgrad_kernel(
     tl.store(base + I * stride_on, acc_u.to(tl.bfloat16), mask=out_mask)
 
 
-def _swiglu_dgrad(gu, dh, w, offs, *, BLOCK_M=128, BLOCK_N=128, BLOCK_K=32, num_warps=8, num_stages=3):
+def _swiglu_dgrad(gu, dh, w, offs, *, row_scale=None, BLOCK_M=128, BLOCK_N=128, BLOCK_K=32,
+                  num_warps=8, num_stages=3):
     # 128x128 tiles halve the per-tile SwiGLU-derivative recompute along N:
     # 1.08x dense / 1.19x MoE over 64x64 on GB10, bit-identical output.
     R, twoI = gu.shape
@@ -2006,14 +2032,17 @@ def _swiglu_dgrad(gu, dh, w, offs, *, BLOCK_M=128, BLOCK_N=128, BLOCK_K=32, num_
     E, _, N = w.shape
     out = torch.empty(R, N, device=gu.device, dtype=gu.dtype)
     grid = ((triton.cdiv(R, BLOCK_M) + E) * triton.cdiv(N, BLOCK_N),)
-    _swiglu_dgrad_kernel[grid](gu, dh, w, offs, out, I, N, gu.stride(0), dh.stride(0),
+    _swiglu_dgrad_kernel[grid](gu, dh, w, offs, out, gu if row_scale is None else row_scale, I, N,
+                               gu.stride(0), dh.stride(0),
                                w.stride(0), w.stride(1), w.stride(2), out.stride(0),
                                E=E, BLOCK_M=BLOCK_M, BLOCK_N=BLOCK_N, BLOCK_K=BLOCK_K, GROUP_M=8,
+                               SCALE_ROWS=row_scale is not None,
                                num_warps=num_warps, num_stages=num_stages)
     return out
 
 
-def _swiglu_wgrad(gu, dh, x, offs, *, BLOCK_R=64, BLOCK_N=64, BLOCK_K=256, num_warps=8, num_stages=2):
+def _swiglu_wgrad(gu, dh, x, offs, *, row_scale=None, BLOCK_R=64, BLOCK_N=64, BLOCK_K=256,
+                  num_warps=8, num_stages=2):
     # K=256 tiles halve the derivative recompute along K: 1.07x dense /
     # 1.06x MoE over (32, 64, 128) on GB10, bit-identical output.
     R, twoI = gu.shape
@@ -2022,9 +2051,11 @@ def _swiglu_wgrad(gu, dh, x, offs, *, BLOCK_R=64, BLOCK_N=64, BLOCK_K=256, num_w
     E = offs.numel()
     out = torch.empty(E, twoI, K, device=gu.device, dtype=gu.dtype)
     grid = (E * triton.cdiv(I, BLOCK_N) * triton.cdiv(K, BLOCK_K),)
-    _swiglu_wgrad_kernel[grid](gu, dh, x, offs, out, I, K, gu.stride(0), dh.stride(0), x.stride(0),
+    _swiglu_wgrad_kernel[grid](gu, dh, x, offs, out, gu if row_scale is None else row_scale, I, K,
+                               gu.stride(0), dh.stride(0), x.stride(0),
                                out.stride(0), out.stride(1), out.stride(2),
                                E=E, BLOCK_R=BLOCK_R, BLOCK_N=BLOCK_N, BLOCK_K=BLOCK_K,
+                               SCALE_ROWS=row_scale is not None,
                                num_warps=num_warps, num_stages=num_stages)
     return out
 
@@ -2054,6 +2085,47 @@ class _FusedSwiGLU(torch.autograd.Function):
         dx = _swiglu_dgrad(gu, dh, weight, offs)
         dw = _swiglu_wgrad(gu, dh, x, offs)
         return dx, dw, None
+
+
+FUSED_NORM_MLP = True  # --no-fused-norm-mlp: separate post-attention RMSNorm + _FusedSwiGLU
+
+
+def _use_fused_norm_mlp(block, h: torch.Tensor) -> bool:
+    return (FUSED_NORM_MLP and not block.is_sparse and _use_fused_swiglu(h)
+            and h.dim() == 2)
+
+
+class _NormSwiGLU(torch.autograd.Function):
+    """SwiGLU(gate_up(rmsnorm(h))) for a dense MLP: _FusedSwiGLU with the
+    post-attention RMSNorm folded in, as _NormQKVAttention does for qkv. The norm
+    weight is folded into the gate_up weight (W' = W * w), the GEMM normalizes on
+    the fly, and the normalized input is never written or saved. Backward: with
+    dh scaled by rstd, both SwiGLU kernels yield G' = rstd * d_gu, so dW' = G'^T h
+    and P' = G' W'; the norm backward on P' stays a torch op, which inductor fuses
+    with the residual-gradient add."""
+
+    @staticmethod
+    def forward(ctx, h, norm_w, w_gu, eps):
+        wp = (w_gu * norm_w).to(torch.bfloat16).unsqueeze(0)
+        offs = torch.full((1,), h.shape[0], device=h.device, dtype=torch.int32)
+        rstd = torch.empty(h.shape[0], device=h.device, dtype=torch.float32)
+        # 64x64 (the plain kernel's tiles) is best at hidden 512; at 1024, 128x64
+        # with 4 stages runs 9.0 vs 10.4 ms (GB10, 49k rows, I=3072)
+        cfg = dict(BLOCK_M=128, num_stages=4) if h.shape[1] >= 1024 else {}
+        gu, out = _swiglu_gemm(h, wp, offs, rstd=rstd, eps=eps, **cfg)
+        ctx.save_for_backward(h, norm_w, w_gu, wp, gu, offs, rstd)
+        return out
+
+    @staticmethod
+    def backward(ctx, dout):
+        h, norm_w, w_gu, wp, gu, offs, rstd = ctx.saved_tensors
+        dout = dout.contiguous()
+        p = _swiglu_dgrad(gu, dout, wp, offs, row_scale=rstd).float()
+        hf = h.float()
+        coef = rstd * rstd * (hf * p).sum(-1) / h.shape[1]
+        dh = (p - coef[:, None] * hf).to(h.dtype)
+        dwp = _swiglu_wgrad(gu, dout, h, offs, row_scale=rstd)[0].float()
+        return dh, (dwp * w_gu).sum(0), dwp * norm_w, None
 
 
 class TopKRouter(nn.Module):
@@ -2288,6 +2360,10 @@ class Block(nn.Module):
                 self.post_attention_layernorm.eps,
             )
             return y, None, None
+        if _use_fused_norm_mlp(self, h):
+            norm = self.post_attention_layernorm
+            out = _NormSwiGLU.apply(h, norm.weight, self.mlp.gate_up_proj.weight, norm.eps)
+            return h + self.mlp.down_proj(out), None, None
         mlp_input = self.post_attention_layernorm(h)
         if self.is_sparse:
             mlp_output, router_logits, selected_experts = self.mlp(mlp_input)
@@ -2562,13 +2638,16 @@ if triton is not None:
     def _bmm_epilogue_kernel(
         A, B, C, Out, M, N, K,
         sab, sam, sak, sbb, sbk, sbn, scb, scm, scn, sob, som, son,
-        alpha, beta,
-        HAS_C: tl.constexpr,
+        alpha, beta, P_PTRS, spm, spn, neg_lr,
+        HAS_C: tl.constexpr, UPDATE: tl.constexpr,
         BLOCK_M: tl.constexpr, BLOCK_N: tl.constexpr, BLOCK_K: tl.constexpr,
         GROUP_M: tl.constexpr,
     ):
         """Out[b] = alpha * A[b] @ B[b] + beta * C[b]; fp32 accumulation,
-        arbitrary strides, tiles must divide M/N/K (checked by the caller)."""
+        arbitrary strides, tiles must divide M/N/K (checked by the caller).
+        With UPDATE, Out is not written: the result, rounded to Out's dtype as it
+        would be stored, is applied to an fp32 parameter instead, P[b] += neg_lr *
+        result, P[b] at address P_PTRS[b] with element strides (spm, spn)."""
         pid = tl.program_id(0)
         bid = tl.program_id(1)
         num_pid_m = tl.cdiv(M, BLOCK_M)
@@ -2595,8 +2674,14 @@ if triton is not None:
         if HAS_C:
             c = tl.load(C + bid * scb + rm[:, None] * scm + rn[None, :] * scn)
             acc = acc + beta * c.to(tl.float32)
-        out_ptrs = Out + bid * sob + rm[:, None] * som + rn[None, :] * son
-        tl.store(out_ptrs, acc.to(Out.dtype.element_ty))
+        if UPDATE:
+            upd = acc.to(Out.dtype.element_ty).to(tl.float32)
+            p_base = tl.load(P_PTRS + bid).to(tl.pointer_type(tl.float32))
+            p_ptrs = p_base + rm[:, None] * spm + rn[None, :] * spn
+            tl.store(p_ptrs, tl.load(p_ptrs) + neg_lr * upd)
+        else:
+            out_ptrs = Out + bid * sob + rm[:, None] * som + rn[None, :] * son
+            tl.store(out_ptrs, acc.to(Out.dtype.element_ty))
 
 
 if triton is not None:
@@ -2645,10 +2730,12 @@ def _bmm_epilogue_supported(rows: int, cols: int) -> bool:
     return triton is not None and rows % 128 == 0 and cols % 64 == 0
 
 
-def _bmm_epilogue(A, B, out, *, C=None, alpha=1.0, beta=0.0):
+def _bmm_epilogue(A, B, out, *, C=None, alpha=1.0, beta=0.0, update=None):
     """out = alpha * bmm(A, B) + beta * C with a fixed, shape-derived tile
     config.  No autotuning: every DDP rank must pick the same kernel so the
-    Muon updates stay bit-identical across ranks."""
+    Muon updates stay bit-identical across ranks. update = (param pointer
+    table (B,) int64, row stride, col stride, -lr): apply the result (rounded
+    to out's dtype) to fp32 parameters instead of writing out."""
     batch, m, k = A.shape
     n = B.shape[-1]
     block_n = 256 if n % 256 == 0 else 128
@@ -2658,10 +2745,12 @@ def _bmm_epilogue(A, B, out, *, C=None, alpha=1.0, beta=0.0):
     else:
         strides_c = C.stride()
     grid = ((m // 128) * (n // block_n), batch)
+    p_ptrs, spm, spn, neg_lr = update if update is not None else (out, 0, 0, 0.0)
     _bmm_epilogue_kernel[grid](
         A, B, C, out, m, n, k,
         *A.stride(), *B.stride(), *strides_c, *out.stride(),
-        float(alpha), float(beta), HAS_C=C is not out,
+        float(alpha), float(beta), p_ptrs, spm, spn, float(neg_lr),
+        HAS_C=C is not out, UPDATE=update is not None,
         BLOCK_M=128, BLOCK_N=block_n, BLOCK_K=block_k, GROUP_M=8,
         num_warps=8 if block_n == 256 else 4,
         num_stages=3 if block_n == 256 else 4,
@@ -2669,7 +2758,7 @@ def _bmm_epilogue(A, B, out, *, C=None, alpha=1.0, beta=0.0):
     return out
 
 
-def _newtonschulz5_batched(X: torch.Tensor, steps: int = 5) -> torch.Tensor:
+def _newtonschulz5_batched(X: torch.Tensor, steps: int = 5, update=None):
     """Orthogonalize a (B, r, c) stack of same-shape matrices (one bmm chain
     per iteration -- the step is kernel-launch-bound on GB10 otherwise).
 
@@ -2683,6 +2772,10 @@ def _newtonschulz5_batched(X: torch.Tensor, steps: int = 5) -> torch.Tensor:
     into the output before accumulating; the Triton kernel reaches 50-60
     TFLOP/s with the same fp32-accumulate math.  Other devices/shapes use the
     cuBLAS chain.
+
+    update = (param pointer table, neg_lr): on the Triton path the last product
+    is applied straight to the fp32 parameters (p += neg_lr * result, see
+    _bmm_epilogue) and nothing is returned; callers check the return value.
     """
     a, b, c = (3.4445, -4.7750, 2.0315)
     transpose_needed = X.shape[-2] > X.shape[-1]
@@ -2696,10 +2789,17 @@ def _newtonschulz5_batched(X: torch.Tensor, steps: int = 5) -> torch.Tensor:
     )
     B = torch.empty_like(A)
     use_triton = X.is_cuda and _bmm_epilogue_supported(X.shape[1], X.shape[2])
-    for _ in range(steps):
+    for i in range(steps):
         if use_triton:
             _bmm_epilogue(X, X.mT, A)
             _bmm_epilogue(A, A, B, C=A, alpha=c, beta=b)
+            if update is not None and i == steps - 1:
+                # parameters are (rows, cols); X is their transpose when transposed
+                p_ptrs, neg_lr, (sp_r, sp_c) = update
+                spm, spn = (sp_c, sp_r) if transpose_needed else (sp_r, sp_c)
+                _bmm_epilogue(B, X, next_X, C=X, alpha=1.0, beta=a,
+                              update=(p_ptrs, spm, spn, neg_lr))
+                return None
             _bmm_epilogue(B, X, next_X, C=X, alpha=1.0, beta=a)
         else:
             torch.bmm(X, X.mT, out=A)
@@ -2730,6 +2830,19 @@ class MuonAdamWHybrid(torch.optim.Optimizer):
         for group in self.param_groups:
             (self._muon_group if group["use_muon"] else self._adamw_group)(group)
         return loss
+
+    def _param_ptrs(self, items, batch_sizes):
+        """(B,) int64 device table of each staged matrix's fp32 parameter address
+        (cached: parameters do not move between steps)."""
+        ptrs = []
+        for (p, _, _), batch_size in zip(items, batch_sizes):
+            ptrs += [p.data_ptr() + i * p.stride(0) * p.element_size() if p.ndim == 3
+                     else p.data_ptr() for i in range(batch_size)]
+        cache = self.__dict__.setdefault("_ptr_cache", {})
+        key = tuple(ptrs)
+        if key not in cache:
+            cache[key] = torch.tensor(ptrs, dtype=torch.int64, device=items[0][0].device)
+        return cache[key]
 
     def _muon_group(self, group):
         momentum = group["momentum"]
@@ -2775,9 +2888,15 @@ class MuonAdamWHybrid(torch.optim.Optimizer):
                     else:
                         staged.copy_(v)
                 offset += batch_size
-            ortho = _newtonschulz5_batched(stacked, steps=group["ns_steps"])
             # aspect-ratio factor; also what makes Muon lr width-invariant
             lr = group["lr"] * max(1, rows / cols) ** 0.5
+            update = None
+            if stacked.is_cuda and all(p.dtype == torch.float32 and p.is_contiguous()
+                                       for p, _, _ in items):
+                update = (self._param_ptrs(items, batch_sizes), -lr, (cols, 1))
+            ortho = _newtonschulz5_batched(stacked, steps=group["ns_steps"], update=update)
+            if ortho is None:  # applied to the parameters in the last NS product
+                continue
             if ndim == 2:
                 ortho_updates = list(ortho.unbind(0))
             else:
@@ -3306,6 +3425,9 @@ def parse_args() -> argparse.Namespace:
                    help="fold each attention block's input RMSNorm into its qkv GEMM and "
                         "the norm backward + residual-grad add into the qkv dgrad (needs "
                         "--triton-attention; see _NormQKVAttention)")
+    p.add_argument("--fused-norm-mlp", action=argparse.BooleanOptionalAction, default=True,
+                   help="fold each dense MLP's RMSNorm into its fused SwiGLU GEMM "
+                        "(needs --fused-swiglu; see _NormSwiGLU)")
     p.add_argument("--fused-qk-rope", action=argparse.BooleanOptionalAction, default=True,
                    help="one Triton pass each way for q/k RMSNorm + RoPE around "
                         "flash-attn (see _QKNormRoPEAttention)")
@@ -3386,8 +3508,9 @@ def main() -> None:
     elif mlp_only_layers:
         raise ValueError("--mlp-only-layers requires --num-experts > 0")
     data_seed = args.data_seed if args.data_seed is not None else args.seed
-    global FUSED_SWIGLU, FUSED_QK_ROPE, FP8_MLP, TRITON_ATTENTION, FUSED_NORM_QKV
+    global FUSED_SWIGLU, FUSED_QK_ROPE, FP8_MLP, TRITON_ATTENTION, FUSED_NORM_QKV, FUSED_NORM_MLP
     FUSED_SWIGLU = args.fused_swiglu
+    FUSED_NORM_MLP = args.fused_norm_mlp
     FUSED_NORM_QKV = args.fused_norm_qkv
     FUSED_QK_ROPE = args.fused_qk_rope
     FP8_MLP = args.fp8_mlp

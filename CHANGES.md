@@ -1,5 +1,44 @@
 # Changes
 
+## 2026-10-01 — dense MLP RMSNorm folded into the SwiGLU GEMM; Muon update fused into Newton-Schulz
+
+1. **`--fused-norm-mlp` (default on), `_NormSwiGLU`.** The bf16 dense MLP's
+   post-attention RMSNorm gets the treatment the attention input norm got in
+   the previous entry: its weight is folded into the gate_up weight, the
+   fused SwiGLU GEMM accumulates the row sum of squares from the x tiles it
+   already reads and scales gate/up by rstd before the activation, and the
+   normalized input is never written or saved (-0.75 GiB peak at 50M). In the
+   backward, scaling dh by rstd makes both SwiGLU kernels produce
+   `rstd * d_gu`, so the weight gradient and the dgrad need no extra pass; the
+   norm backward stays a torch op so inductor keeps fusing it with the
+   residual-gradient add. Per layer at 50M the GEMM costs 0.08 ms more and the
+   0.45 ms norm pass is gone. At hidden 1024 the GEMM moves to 128x64 tiles /
+   4 stages, which also beats the old 64x64 plain kernel (9.0 vs 10.1 ms).
+   Closer to an fp32 reference than the unfused path (output and every
+   gradient, hidden 512 and 1024). `--fp8-mlp` and MoE blocks are unaffected
+   (their norms were already fused or feed the router).
+2. **Muon parameter update in the last Newton-Schulz product.** The update
+   was a `_foreach_add_` of transposed bf16 views into fp32 parameters, which
+   fell back to 64 separate elementwise kernels (2.4 ms/step). The last NS
+   GEMM now applies `p += -lr * result` itself (the result rounded to bf16
+   first, as before) through a cached per-matrix parameter-address table: the
+   bf16 result is never written. Bit-identical parameters after each step.
+
+Throughput (5M tokens, 104 steps, steady window; one fresh compile per run):
+
+| | `59fdba2` | this tree | |
+| --- | ---: | ---: | ---: |
+| dense 50M | 120.4k-120.7k (407 ms/step) | **122.6k-123.0k (399-401 ms)** | +1.6-1.9% |
+| dense 0.6B | 17.0k-17.2k | **17.4k-17.6k** | +2.5% |
+| dense 50M `--fp8-mlp` (Muon only) | 139.0k-140.0k | **140.4k** | +0.5% |
+| MoE 8x2 (Muon only) | 87.4k | **87.7k** | +0.3% |
+
+The 50M runs split the two: 122.6k with the norm fusion alone, 123.0k with both.
+
+Quality, the 4,100-step parity protocol (bf16; final held-out loss, training
+time): `59fdba2` 0.8809 / 0.8771 (1,673 s), this tree 0.8753 / 0.8765
+(1,641 s). `--fp8-mlp` and MoE only get the bit-identical Muon change.
+
 ## 2026-10-01 — input RMSNorm folded into the qkv GEMM; attention delta folded into dQ
 
 A fresh kernel trace of the 50M `--fp8-mlp` step on `0d80ecd` (365 ms GPU,

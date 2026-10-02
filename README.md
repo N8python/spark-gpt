@@ -108,7 +108,7 @@ torchrun --nnodes 2 --node-rank <0|1> --nproc-per-node 1 \
 ```
 
 Defaults are a 50M model (16 layers / 512 dim / 4Q+2KV heads / head_dim 128)
-on 1B tokens — about 2.3h on one GB10 (~119k tok/s), ~1.3h on two (~218k
+on 1B tokens — about 2.3h on one GB10 (~121k tok/s), ~1.3h on two (~218k
 aggregate, ~1.86× single-node). The Qwen3-0.6B shape (440M non-embedding params) is
 `--model-layers 28 --model-dim 1024 --attention-heads 16 --kv-heads 8
 --intermediate-size 3072` — same hyperparameters, muP transfers them.
@@ -180,11 +180,12 @@ backward is deterministic, needs no per-query-head dK/dV buffers or fp32 dQ
 accumulator, and applies the RoPE + q/k-norm backward in its epilogues;
 `--no-triton-attention` falls back to flash-attn. Each attention block's
 input RMSNorm is folded into its qkv GEMM in both directions
-(`--fused-norm-qkv`, on by default). GEMM autotuning
+(`--fused-norm-qkv`, on by default), and each dense MLP's into its SwiGLU
+GEMM (`--fused-norm-mlp`, on by default). GEMM autotuning
 benchmarks on every rank; identical GB10s pick identical kernels (2-node
 checkpoints verified bit-identical), but on heterogeneous nodes use
 `--no-autotune-gemm`. At the 0.6B shape the
-trainer sustains ~17.1k tok/s on a single GB10 at the default 49,152-token
+trainer sustains ~17.5k tok/s on a single GB10 at the default 49,152-token
 window (~28.2k aggregate on two before the 2026-09-30 changes; torch
 2.12.0+cu130, flash-attn 2.8.3.post1). That is fixed-shape
 compute-token throughput; real loss-token throughput is reported separately
@@ -197,14 +198,14 @@ steady window tok/s over the second half of the run), before and after the
 
 | Model | Total params | Active params | Window tok/s @ `40096c0` | @ `cbb60d6` (08-23) | Window tok/s now | Peak allocation |
 | --- | ---: | ---: | ---: | ---: | ---: | ---: |
-| Dense 16L/512d/MLP1536 | 50,617,856 | 50,617,856 | 83.7k | 96.8k-99.6k | **120.4k-120.7k** | 13.2 GiB |
-| MoE 8 experts/top-2/I768 | 163,929,600 | 50,683,392 | 59.3k | 72.4k-74.9k | **87.4k** | 17.4 GiB |
-| Dense 0.6B 28L/1024d/MLP3072 | 440,997,888 | 440,997,888 | 13.8k-14.0k | 14.6k-14.8k | **17.0k-17.2k** | 59.9 GiB |
+| Dense 16L/512d/MLP1536 | 50,617,856 | 50,617,856 | 83.7k | 96.8k-99.6k | **122.6k-123.0k** | 12.5 GiB |
+| MoE 8 experts/top-2/I768 | 163,929,600 | 50,683,392 | 59.3k | 72.4k-74.9k | **87.7k** | 17.4 GiB |
+| Dense 0.6B 28L/1024d/MLP3072 | 440,997,888 | 440,997,888 | 13.8k-14.0k | 14.6k-14.8k | **17.4k-17.6k** | 57.3 GiB |
 
 Dense numbers vary by about ±1% between compiles (GEMM autotune picks), so
 they are quoted as ranges (the 0.6B range is one fresh compile on each of
 two GB10s, as are the current dense numbers; the current MoE number is a
-single run). The 0.6B shape gains less (~23% over `40096c0`, vs ~44% dense), most likely because GEMMs take a larger
+single run). The 0.6B shape gains less (~26% over `40096c0`, vs ~46% dense), most likely because GEMMs take a larger
 share of the step at width 1024, while most of the kernel work removed
 overhead and bandwidth-bound passes. The compute-matched MoE delivers ~73% of
 dense throughput (was 69%). Matched 1B-token runs of both defaults (base vs this
@@ -214,15 +215,16 @@ each other — MoE 0.7443 vs 0.7434, dense 0.7737 vs 0.7717 — at 20% (MoE) and
 The 2026-09-30 changes were checked the same way on a 4,100-step (~200M
 token) prefix of the dense schedule: held-out loss ahead or tied at all ten
 checkpoints, 0.8810 vs 0.8817 at the end; the 2026-10-01 Triton attention
-ended at 0.8791 vs 0.8810 on the same protocol, and the fused input norm at
-0.8809 / 0.8771 vs 0.8791 / 0.8775 (two runs each).
+ended at 0.8791 vs 0.8810 on the same protocol, the fused input norm at
+0.8809 / 0.8771 vs 0.8791 / 0.8775, and the fused MLP norm at 0.8753 / 0.8765
+(two runs each).
 
 ### Opt-in: `--fp8-mlp`
 
 Dense MLP sub-blocks can keep their activations and activation gradients in
 fp8 (e4m3 / e5m2, delayed per-tensor scaling, fp32 master weights, bf16
-validation): 50M 120.5k -> 139.5k tok/s (+16%), 0.6B 17.1k -> 19.6k (+15%),
-and ~25% less peak memory; MoE experts likewise (8x2 default 87.4k -> 95.3k,
+validation): 50M 122.8k -> 140.4k tok/s (+14%), 0.6B 17.5k -> 19.6k (+12%),
+and ~25% less peak memory; MoE experts likewise (8x2 default 87.7k -> 95.3k,
 +9%). It changes numerics, so it is off by
 default; on a matched full 1B-token run it ended ahead of bf16 on held-out loss
 (0.7706 vs 0.7723) in 12% less training time, and the MoE default was ahead at

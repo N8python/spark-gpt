@@ -324,6 +324,29 @@ class CudaGroupedMMTest(unittest.TestCase):
                     actual, expected, rtol=0.0, atol=0.0
                 )
 
+    def test_muon_update_fused_into_newton_schulz_matches_foreach_add(self):
+        torch.manual_seed(0)
+        shapes = ((1536, 512), (512, 768), (2, 256, 512))  # transposed, plain, 3-D experts
+
+        def run(fused):
+            torch.manual_seed(1)
+            params = [torch.nn.Parameter(torch.randn(*s_, device="cuda")) for s_ in shapes]
+            for p_ in params:
+                p_.grad = torch.randn_like(p_)
+            opt = train.MuonAdamWHybrid([{"params": params, "use_muon": True, "lr": 0.02}])
+            orig = train._newtonschulz5_batched
+            if not fused:
+                train._newtonschulz5_batched = lambda x, steps=5, update=None: orig(x, steps)
+            try:
+                for _ in range(2):
+                    opt.step()
+            finally:
+                train._newtonschulz5_batched = orig
+            return [p_.detach() for p_ in params]
+
+        for f, r in zip(run(True), run(False)):
+            torch.testing.assert_close(f, r, rtol=0.0, atol=0.0)
+
     def test_output_scatter_matches_inverse_gather(self):
         torch.manual_seed(0)
         num_tokens, top_k, hidden_dim = 256, 2, 128
@@ -447,6 +470,48 @@ class CudaGroupedMMTest(unittest.TestCase):
         for gradient in (experts.gate_up_proj.grad, experts.down_proj.grad):
             self.assertTrue(torch.isfinite(gradient).all())
             torch.testing.assert_close(gradient[2:], torch.zeros_like(gradient[2:]))
+
+
+class FusedNormMLPTest(unittest.TestCase):
+    def test_norm_swiglu_tracks_fp32_reference(self):
+        if train.triton is None or not torch.cuda.is_available():
+            self.skipTest("CUDA + triton are required")
+        for hidden in (512, 1024):
+            torch.manual_seed(0)
+            norm = train.RMSNorm(hidden).cuda()
+            with torch.no_grad():
+                norm.weight.uniform_(0.5, 1.5)
+            w_gu = (torch.randn(2 * 768, hidden, device="cuda") * hidden ** -0.5).requires_grad_(True)
+            rows = 1000  # not a multiple of any tile size
+            h0 = (torch.randn(rows, hidden, device="cuda") * 3.0).to(torch.bfloat16)
+            probe = torch.randn(rows, 768, device="cuda")
+            params = [norm.weight, w_gu]
+
+            def run(fn, dtype):
+                h = h0.to(dtype).requires_grad_(True)
+                out = fn(h)
+                g = torch.autograd.grad((out.float() * probe).sum(), [h] + params)
+                return (out.float(),) + tuple(t.float() for t in g)
+
+            def fp32(h):
+                xn = h * torch.rsqrt(h.pow(2).mean(-1, keepdim=True) + norm.eps) * norm.weight
+                gate, up = (xn @ w_gu.t()).chunk(2, dim=-1)
+                return torch.nn.functional.silu(gate) * up
+
+            def unfused(h):
+                with torch.amp.autocast("cuda", dtype=torch.bfloat16):
+                    offs = torch.full((1,), rows, device="cuda", dtype=torch.int32)
+                    return train._FusedSwiGLU.apply(norm(h), w_gu.to(torch.bfloat16).unsqueeze(0), offs)
+
+            ref = run(fp32, torch.float32)
+            base = run(unfused, torch.bfloat16)
+            fused = run(lambda h: train._NormSwiGLU.apply(h, norm.weight, w_gu, norm.eps), torch.bfloat16)
+            for name, f, b, r in zip(("out", "dh", "dnorm_w", "dW_gu"), fused, base, ref):
+                err_f = ((f - r).norm() / r.norm()).item()
+                err_b = ((b - r).norm() / r.norm()).item()
+                self.assertTrue(torch.isfinite(f).all(), name)
+                self.assertLess(err_f, 1.5 * err_b + 1e-3,
+                                f"hidden {hidden} {name}: fused {err_f:.2e} vs unfused {err_b:.2e}")
 
 
 if __name__ == "__main__":
