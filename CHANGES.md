@@ -1,5 +1,69 @@
 # Changes
 
+## 2026-10-01 — input RMSNorm folded into the qkv GEMM; attention delta folded into dQ
+
+A fresh kernel trace of the 50M `--fp8-mlp` step on `0d80ecd` (365 ms GPU,
+no idle gaps): fp8 MLP 153 ms, attention core 91.5 ms, attention projections
+60 ms (at the bandwidth floor), input RMSNorm 21.5 ms, optimizer 17 ms, q/k
+norm + RoPE forward 12 ms. Two of those buckets still paid for passes that
+only moved data:
+
+1. **`--fused-norm-qkv` (default on), `_NormQKVAttention`.** Each attention
+   block's input RMSNorm was a separate pass each way: write the normalized
+   input and read it back in the qkv GEMM, then re-read the qkv dgrad's output
+   in the norm backward. Now the norm weight is folded into the qkv weight
+   (`W' = W * w`) and `_norm_qkv_fwd_kernel` computes `qkv = rstd * (x @ W'^T)`,
+   accumulating the row sum of squares from the same x tiles the MMA reads:
+   x is read once and the normalized copy is never written or saved (-0.75
+   GiB peak at 50M). The Function covers the whole attention sub-block so its
+   backward sees `dh`: the attention epilogues store `G' = rstd * dqkv`, which
+   makes the weight gradient a plain GEMM (`dW' = G'^T @ x`), and
+   `_norm_qkv_dgrad_kernel` computes `dx = dh + P - (rstd^2/D) x rowsum(x P)`,
+   `P = G' @ W'`, in one pass over whole rows (qkv dgrad + norm backward +
+   residual-gradient add). At hidden 1024 that whole-row tile re-reads W'
+   every 32 rows and loses to GEMM + norm backward (8.2 vs 6.0 ms/layer), so
+   wider models use the two-pass form; the fused forward wins at both widths.
+   Numerics: closer to an fp32 reference than the unfused path for the block
+   output and every gradient (the normalized input is never rounded to bf16).
+2. **Attention backward:** the `delta = rowsum(dO * O)` preprocess (0.5
+   ms/layer, bandwidth-bound) is gone. The dQ kernel loads the dO tile anyway,
+   so it now runs first, computes delta itself and stores it for the dK/dV
+   kernel. A tile sweep on real packed windows moved dQ to BLOCK_N=32, 3
+   stages; forward and dK/dV were already at their best configs.
+
+Per layer at 50M (bf16 trace, 424.0 -> 406.9 ms/step): norm + qkv forward
+1.21 -> 0.80 ms, qkv dgrad + norm backward 1.60 -> 1.31 ms, attention
+backward 4.47 -> 3.97 ms. The first tile configs of the two new kernels made
+them no faster than the passes they replaced in-graph; a microbenchmark sweep
+(forward 128x128x32 / 4 warps, dgrad 32 rows x 32 / 8 warps) found the above.
+
+Throughput (5M tokens, 104 steps, steady window; one fresh compile on each
+GB10; the 0.6B rows are same-box A/Bs, main and this tree back to back on
+each box):
+
+| | `0d80ecd` | this tree | |
+| --- | ---: | ---: | ---: |
+| dense 50M | 115.0k (427 ms/step) | **120.4k-120.7k (407 ms)** | +4.8% |
+| dense 50M `--fp8-mlp` | 132.6k-133.0k (370 ms) | **139.0k-140.0k (351-354 ms)** | +5.0% |
+| MoE 8x2 | 85.2k | **87.4k** | +2.6% |
+| MoE 8x2 `--fp8-mlp` | 92.4k | **95.3k** | +3.2% |
+| dense 0.6B | 16.5k-16.7k | **17.0k-17.2k** | +3.0-3.2% |
+| dense 0.6B `--fp8-mlp` | 19.0k-19.2k | **19.5k-19.7k** | +2.4-2.5% |
+| dense 50M, 2 nodes | 216k | **224k** (1.86x) | +3.5% |
+
+One earlier 0.6B bf16 run of this tree measured 16.1k with the same GEMM
+autotune picks as the 17.2k run on the same box; unexplained.
+
+Quality, the 4,100-step parity protocol (final held-out loss; training time):
+
+| | `0d80ecd` | this tree |
+| --- | ---: | ---: |
+| bf16 | 0.8791, 0.8775 (1,758 s) | 0.8809, 0.8771 (1,673 s) |
+| `--fp8-mlp` | 0.8757, 0.8761, 0.8762, 0.8843 (1,537 s) | 0.8767 (1,459 s) |
+
+Means 0.8783 vs 0.8790 (bf16): the two runs of each tree differ by more
+than the trees do.
+
 ## 2026-10-01 — Triton attention replaces flash-attn on the default path
 
 Flash-attn was 27% of the fp8 step, and its main kernels were already

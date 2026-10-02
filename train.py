@@ -231,6 +231,15 @@ class Attention(nn.Module):
         out = _varlen_attention(q, k, v, cu_seqlens, max_seqlen)
         return self.o_proj(out.reshape(total, self.n_heads * self.head_dim))
 
+    def forward_with_norm(self, x, norm, rope, cu_seqlens, max_seqlen):
+        """x + self(norm(x)) as one _NormQKVAttention (norm folded into qkv_proj)."""
+        _, _, cos_table, sin_table, position_ids = rope
+        return _NormQKVAttention.apply(
+            x, norm.weight, self.qkv_proj.weight, self.q_norm.weight, self.k_norm.weight,
+            self.o_proj.weight, cos_table, sin_table, position_ids, cu_seqlens, max_seqlen,
+            self.n_heads, self.n_kv_heads, norm.eps, self.q_norm.eps,
+        )
+
 
 class MLP(nn.Module):
     def __init__(self, dim: int, hidden_dim: int):
@@ -423,14 +432,15 @@ def _attn_fwd_kernel(Q, K, V, O, LSE, CU, stride_v, v_col, SM_SCALE: tl.constexp
 
 @triton.jit
 def _qk_norm_rope_bwd_tile(g1, g2, X, x_stride, x_col, RSTD, r_stride, r_col, W, COS, SIN,
-                           POS, rows, rmask, DQKV, dqkv_stride, dqkv_col,
-                           HALF: tl.constexpr, D: tl.constexpr):
+                           POS, rows, rmask, DQKV, dqkv_stride, dqkv_col, RS,
+                           HALF: tl.constexpr, D: tl.constexpr, SCALE_ROWS: tl.constexpr):
     """Epilogue shared by the fused attention backward kernels: g1/g2 are the two
     rotate-half halves of d(rotated q or k) for `rows` (already rounded to bf16);
     applies the RoPE backward (rounded to bf16, as the unfused graph materializes
     it), then the per-head RMSNorm backward against the pre-norm x read from qkv,
     writes d(pre-norm) into dqkv and returns the two halves of this tile's
-    norm-weight gradient partial."""
+    norm-weight gradient partial. SCALE_ROWS multiplies the stored gradient by
+    RS[row] (the input RMSNorm's rstd, see _NormQKVAttention)."""
     m = rmask[:, None]
     rh = tl.arange(0, HALF)
     pos = tl.load(POS + rows, mask=rmask, other=0)
@@ -451,30 +461,23 @@ def _qk_norm_rope_bwd_tile(g1, g2, X, x_stride, x_col, RSTD, r_stride, r_col, W,
     dw2 = dn2 * w2[None, :]
     s = tl.sum(dw1 * x1, 1) + tl.sum(dw2 * x2, 1)
     coef = (s * -0.5 * (r * r * r) * (2.0 / D))[:, None]
+    rr = r[:, None]
+    if SCALE_ROWS:
+        rs = tl.load(RS + rows, mask=rmask, other=0.0)[:, None]
+        coef = coef * rs
+        rr = rr * rs
     out = DQKV + dqkv_col + rows[:, None] * dqkv_stride + rh[None, :]
-    tl.store(out, (coef * x1 + dw1 * r[:, None]).to(tl.bfloat16), mask=m)
-    tl.store(out + HALF, (coef * x2 + dw2 * r[:, None]).to(tl.bfloat16), mask=m)
+    tl.store(out, (coef * x1 + dw1 * rr).to(tl.bfloat16), mask=m)
+    tl.store(out + HALF, (coef * x2 + dw2 * rr).to(tl.bfloat16), mask=m)
     return tl.sum(dn1 * (x1 * r[:, None]), 0), tl.sum(dn2 * (x2 * r[:, None]), 0)
 
 
 @triton.jit
-def _attn_bwd_pre_kernel(O, DO, DELTA, T, HQ: tl.constexpr, D: tl.constexpr, BLOCK: tl.constexpr):
-    """delta = rowsum(dO * O) per (token, head)."""
-    r = tl.program_id(0) * BLOCK + tl.arange(0, BLOCK)
-    h = tl.program_id(1)
-    rd = tl.arange(0, D)
-    m = (r < T)[:, None]
-    o = tl.load(O + r[:, None] * (HQ * D) + h * D + rd[None, :], mask=m, other=0.0).to(tl.float32)
-    do = tl.load(DO + r[:, None] * (HQ * D) + h * D + rd[None, :], mask=m, other=0.0).to(tl.float32)
-    tl.store(DELTA + r * HQ + h, tl.sum(o * do, 1), mask=r < T)
-
-
-@triton.jit
 def _attn_bwd_dkdv_kernel(Q, K, V, DO, LSE, DELTA, DK, CU, stride_v, v_col, stride_dk, dk_col,
-                          dv_col, X, RSTD, KW, COS, SIN, POS, DWK, n_seq,
+                          dv_col, X, RSTD, KW, COS, SIN, POS, DWK, RS, n_seq,
                           SM_SCALE: tl.constexpr, HQ: tl.constexpr, HKV: tl.constexpr,
                           D: tl.constexpr, BLOCK_M: tl.constexpr, BLOCK_N: tl.constexpr,
-                          FUSE_QK: tl.constexpr):
+                          FUSE_QK: tl.constexpr, SCALE_ROWS: tl.constexpr):
     """dK, dV for one (key block, segment, kv head), looping over the kv head's
     HQ // HKV query heads (native GQA: no per-query-head buffers to sum) and the
     query blocks at or after the key block. Recomputes P from the saved LSE. DK is
@@ -529,23 +532,27 @@ def _attn_bwd_dkdv_kernel(Q, K, V, DO, LSE, DELTA, DK, CU, stride_v, v_col, stri
         p1, p2 = _qk_norm_rope_bwd_tile(
             g1, g2, X, (HQ + 2 * HKV) * D, (HQ + hk) * D,
             RSTD, HQ + HKV, HQ + hk, KW, COS, SIN, POS, rn, kmask,
-            DK, stride_dk, dk_col + hk * D, HALF=HALF, D=D)
+            DK, stride_dk, dk_col + hk * D, RS, HALF=HALF, D=D, SCALE_ROWS=SCALE_ROWS)
         tl.store(DWK + pidx * D + rh, p1)
         tl.store(DWK + pidx * D + HALF + rh, p2)
     else:
         tl.store(DK + dk_col + rn[:, None] * stride_dk + hk * D + rd[None, :], dkb, mask=kmask[:, None])
+    if SCALE_ROWS:
+        dv = dv * tl.load(RS + rn, mask=kmask, other=0.0)[:, None]
     tl.store(DK + dv_col + rn[:, None] * stride_dk + hk * D + rd[None, :], dv.to(tl.bfloat16),
              mask=kmask[:, None])
 
 
 @triton.jit
-def _attn_bwd_dq_kernel(Q, K, V, DO, LSE, DELTA, DQ, CU, stride_v, v_col,
-                        X, RSTD, QW, COS, SIN, POS, DWQ, n_seq, SM_SCALE: tl.constexpr,
+def _attn_bwd_dq_kernel(Q, K, V, O, DO, LSE, DELTA, DQ, CU, stride_v, v_col,
+                        X, RSTD, QW, COS, SIN, POS, DWQ, RS, n_seq, SM_SCALE: tl.constexpr,
                         HQ: tl.constexpr, HKV: tl.constexpr, D: tl.constexpr,
-                        BLOCK_M: tl.constexpr, BLOCK_N: tl.constexpr, FUSE_QK: tl.constexpr):
+                        BLOCK_M: tl.constexpr, BLOCK_N: tl.constexpr, FUSE_QK: tl.constexpr,
+                        SCALE_ROWS: tl.constexpr):
     """dQ for one (query block, segment, query head), accumulated as its two
     rotate-half halves: no fp32 accumulator buffer, no atomics, no conversion pass.
-    With FUSE_QK the epilogue applies the RoPE + q-norm backward and writes
+    Runs before the dK/dV kernel and computes delta = rowsum(dO * O) itself (it
+    loads the dO tile anyway), storing it to DELTA for that kernel. With FUSE_QK the epilogue applies the RoPE + q-norm backward and writes
     d(pre-norm q) into dqkv (DQ = dqkv base) plus a q-norm weight-gradient partial."""
     HALF: tl.constexpr = D // 2
     mb = tl.program_id(0)
@@ -570,7 +577,9 @@ def _attn_bwd_dq_kernel(Q, K, V, DO, LSE, DELTA, DQ, CU, stride_v, v_col,
     q = tl.load(Q + rm[:, None] * (HQ * D) + h * D + rd[None, :], mask=qmask[:, None], other=0.0)
     do = tl.load(DO + rm[:, None] * (HQ * D) + h * D + rd[None, :], mask=qmask[:, None], other=0.0)
     lse = tl.load(LSE + rm * HQ + h, mask=qmask, other=0.0)
-    dl = tl.load(DELTA + rm * HQ + h, mask=qmask, other=0.0)
+    o = tl.load(O + rm[:, None] * (HQ * D) + h * D + rd[None, :], mask=qmask[:, None], other=0.0)
+    dl = tl.sum(o.to(tl.float32) * do.to(tl.float32), 1)
+    tl.store(DELTA + rm * HQ + h, dl, mask=qmask)
     dq = tl.zeros((BLOCK_M, D), tl.float32)
     qk_scale = SM_SCALE * 1.4426950408889634
     for n0 in range(start, tl.minimum(q_lo + BLOCK_M, end), BLOCK_N):
@@ -589,7 +598,7 @@ def _attn_bwd_dq_kernel(Q, K, V, DO, LSE, DELTA, DQ, CU, stride_v, v_col,
         p1, p2 = _qk_norm_rope_bwd_tile(
             g1, g2, X, (HQ + 2 * HKV) * D, h * D,
             RSTD, HQ + HKV, h, QW, COS, SIN, POS, rm, qmask,
-            DQ, (HQ + 2 * HKV) * D, h * D, HALF=HALF, D=D)
+            DQ, (HQ + 2 * HKV) * D, h * D, RS, HALF=HALF, D=D, SCALE_ROWS=SCALE_ROWS)
         tl.store(DWQ + pidx * D + rh, p1)
         tl.store(DWQ + pidx * D + HALF + rh, p2)
     else:
@@ -611,20 +620,19 @@ def _triton_attention_fwd(q, k, v_src, v_col, cu_seqlens, max_seqlen, scale):
 
 
 def _triton_attention_bwd(dout, q, k, v_src, v_col, out, lse, cu_seqlens, max_seqlen, scale,
-                          dk, dv_dst, dv_col, qk_norm=None):
+                          dk, dv_dst, dv_col, qk_norm=None, row_scale=None):
     """dv lands in columns [dv_col, dv_col + Hkv*D) of the contiguous 2-D dv_dst
     (e.g. dqkv). Unfused (dk=None): dk lands in dv_dst's columns [0, Hkv*D) and dq
     is returned. With qk_norm = (qkv, rstd, q_w, k_w, cos_table, sin_table,
     position_ids) -- q/k being the rotated, normed heads of that qkv -- the RoPE +
     qk-norm backward runs in the kernels' epilogues: dq and dk land as d(pre-norm)
-    in dv_dst's q/k columns and the norm-weight gradients are returned: (dq_w, dk_w)."""
+    in dv_dst's q/k columns and the norm-weight gradients are returned: (dq_w, dk_w).
+    row_scale (T,) fp32, fused path only, multiplies every row of dq/dk/dv as stored."""
     total, n_heads, head_dim = q.shape
     n_kv = k.shape[1]
     n_seq = cu_seqlens.shape[0] - 1
     dev = q.device
     delta = torch.empty(total, n_heads, device=dev, dtype=torch.float32)
-    _attn_bwd_pre_kernel[(triton.cdiv(total, 64), n_heads)](
-        out, dout, delta, total, HQ=n_heads, D=head_dim, BLOCK=64, num_warps=4)
     fuse = qk_norm is not None
     grid_kv = (triton.cdiv(max_seqlen, 128), n_seq, n_kv)
     grid_q = (triton.cdiv(max_seqlen, 128), n_seq, n_heads)
@@ -640,23 +648,42 @@ def _triton_attention_bwd(dout, q, k, v_src, v_col, out, lse, cu_seqlens, max_se
         dq = torch.empty_like(q)
         dk_col = 0
         assert dk is None, "the unfused path returns dk in dv_dst's columns [0, Hkv*D)"
+        assert row_scale is None
+    rs = q if row_scale is None else row_scale
+    _attn_bwd_dq_kernel[grid_q](  # also writes delta, read by the dK/dV kernel
+        q, k, v_src, out, dout, lse, delta, dq, cu_seqlens, v_src.stride(0), v_col,
+        qkv, rstd, q_w, cos_table, sin_table, position_ids, dwq, rs, n_seq, SM_SCALE=scale,
+        HQ=n_heads, HKV=n_kv, D=head_dim, BLOCK_M=128, BLOCK_N=32, FUSE_QK=fuse,
+        SCALE_ROWS=row_scale is not None, num_warps=8, num_stages=3)
     _attn_bwd_dkdv_kernel[grid_kv](
         q, k, v_src, dout, lse, delta, dv_dst, cu_seqlens, v_src.stride(0), v_col,
         dv_dst.stride(0), dk_col, dv_col, qkv, rstd, k_w, cos_table, sin_table, position_ids,
-        dwk, n_seq,
+        dwk, rs, n_seq,
         SM_SCALE=scale, HQ=n_heads, HKV=n_kv, D=head_dim, BLOCK_M=64, BLOCK_N=128,
-        FUSE_QK=fuse, num_warps=8, num_stages=2)
-    _attn_bwd_dq_kernel[grid_q](
-        q, k, v_src, dout, lse, delta, dq, cu_seqlens, v_src.stride(0), v_col,
-        qkv, rstd, q_w, cos_table, sin_table, position_ids, dwq, n_seq, SM_SCALE=scale,
-        HQ=n_heads, HKV=n_kv, D=head_dim, BLOCK_M=128, BLOCK_N=64, FUSE_QK=fuse,
-        num_warps=8, num_stages=2)
+        FUSE_QK=fuse, SCALE_ROWS=row_scale is not None, num_warps=8, num_stages=2)
     if fuse:
         return dwq.sum(0), dwk.sum(0)
     return dq
 
 
 QK_ROPE_BLOCK_T = 32
+
+
+def _qk_norm_rope_fwd(qkv, q_weight, k_weight, cos_table, sin_table, position_ids,
+                      n_heads, n_kv_heads, eps):
+    """Rotated, normed q (T, Hq, D) and k (T, Hkv, D) from qkv, plus the per-head rstd."""
+    total = qkv.shape[0]
+    head_dim = cos_table.shape[1]
+    q = torch.empty(total, n_heads, head_dim, device=qkv.device, dtype=qkv.dtype)
+    k = torch.empty(total, n_kv_heads, head_dim, device=qkv.device, dtype=qkv.dtype)
+    rstd = torch.empty(total, n_heads + n_kv_heads, device=qkv.device, dtype=torch.float32)
+    _qk_norm_rope_fwd_kernel[(triton.cdiv(total, QK_ROPE_BLOCK_T),)](
+        qkv, q_weight, k_weight, cos_table, sin_table, position_ids, q, k, rstd,
+        total, qkv.stride(0),
+        EPS=eps, HQ=n_heads, HKV=n_kv_heads, D=head_dim, BLOCK_T=QK_ROPE_BLOCK_T,
+        num_warps=4,
+    )
+    return q, k, rstd
 
 
 class _QKNormRoPEAttention(torch.autograd.Function):
@@ -671,16 +698,8 @@ class _QKNormRoPEAttention(torch.autograd.Function):
                 cu_seqlens, max_seqlen, n_heads, n_kv_heads, eps):
         total = qkv.shape[0]
         head_dim = cos_table.shape[1]
-        q = torch.empty(total, n_heads, head_dim, device=qkv.device, dtype=qkv.dtype)
-        k = torch.empty(total, n_kv_heads, head_dim, device=qkv.device, dtype=qkv.dtype)
-        rstd = torch.empty(total, n_heads + n_kv_heads, device=qkv.device, dtype=torch.float32)
-        grid = (triton.cdiv(total, QK_ROPE_BLOCK_T),)
-        _qk_norm_rope_fwd_kernel[grid](
-            qkv, q_weight, k_weight, cos_table, sin_table, position_ids, q, k, rstd,
-            total, qkv.stride(0),
-            EPS=eps, HQ=n_heads, HKV=n_kv_heads, D=head_dim, BLOCK_T=QK_ROPE_BLOCK_T,
-            num_warps=4,
-        )
+        q, k, rstd = _qk_norm_rope_fwd(qkv, q_weight, k_weight, cos_table, sin_table,
+                                       position_ids, n_heads, n_kv_heads, eps)
         v = qkv[:, (n_heads + n_kv_heads) * head_dim:].view(total, n_kv_heads, head_dim)
         scale = head_dim ** -0.5
         if TRITON_ATTENTION:
@@ -731,6 +750,159 @@ class _QKNormRoPEAttention(torch.autograd.Function):
         )
         dw = dw.sum(0)
         return (dqkv, dw[0], dw[1], None, None, None, None, None, None, None, None)
+
+
+# --------------------------------------------------------------------------- #
+# Attention sub-block with the input RMSNorm folded into the qkv GEMM (Triton)
+# --------------------------------------------------------------------------- #
+FUSED_NORM_QKV = True  # --no-fused-norm-qkv: separate input RMSNorm + qkv_proj
+
+
+def _use_fused_norm_qkv(attn, x: torch.Tensor) -> bool:
+    d = x.shape[1]
+    # the dgrad kernel tiles whole rows (power-of-two hidden size); the forward grid
+    # assumes a 128-divisible qkv width
+    return (FUSED_NORM_QKV and TRITON_ATTENTION and _use_fused_qk_rope(x, attn.head_dim)
+            and d % 64 == 0 and d & (d - 1) == 0 and d <= 1024
+            and attn.qkv_proj.weight.shape[0] % 128 == 0)
+
+
+@triton.jit
+def _norm_qkv_fwd_kernel(X, WT, QKV, RSTD, T, N, EPS: tl.constexpr, K: tl.constexpr,
+                         BLOCK_M: tl.constexpr, BLOCK_N: tl.constexpr, BLOCK_K: tl.constexpr,
+                         GROUP_M: tl.constexpr):
+    """qkv = rstd * (x @ W'^T), W' = W * norm_weight (per input column), rstd =
+    rsqrt(mean(x^2) + eps): the input RMSNorm folded into the qkv GEMM. The row sum
+    of squares accumulates from the same x tiles the MMA consumes, so x is read once
+    and no normalized copy is written. WT is W'^T (K, N), contiguous; the n_tile == 0
+    programs also store rstd for the backward."""
+    pid = tl.program_id(0)
+    num_m = tl.cdiv(T, BLOCK_M)
+    num_n = tl.cdiv(N, BLOCK_N)
+    group = GROUP_M * num_n
+    first_m = (pid // group) * GROUP_M
+    gsz = tl.minimum(num_m - first_m, GROUP_M)
+    m_tile = first_m + (pid % group) % gsz
+    n_tile = (pid % group) // gsz
+    rm = m_tile * BLOCK_M + tl.arange(0, BLOCK_M)
+    rn = n_tile * BLOCK_N + tl.arange(0, BLOCK_N)
+    rk = tl.arange(0, BLOCK_K)
+    m = (rm < T)[:, None]
+    a_ptrs = X + rm[:, None] * K + rk[None, :]
+    b_ptrs = WT + rk[:, None] * N + rn[None, :]
+    acc = tl.zeros((BLOCK_M, BLOCK_N), dtype=tl.float32)
+    ss = tl.zeros((BLOCK_M,), dtype=tl.float32)
+    for _ in range(0, K, BLOCK_K):
+        a = tl.load(a_ptrs, mask=m, other=0.0)
+        af = a.to(tl.float32)
+        ss += tl.sum(af * af, 1)
+        acc = tl.dot(a, tl.load(b_ptrs), acc)
+        a_ptrs += BLOCK_K
+        b_ptrs += BLOCK_K * N
+    r = tl.rsqrt(ss / K + EPS)
+    tl.store(QKV + rm[:, None] * N + rn[None, :], (acc * r[:, None]).to(tl.bfloat16), mask=m)
+    if n_tile == 0:
+        tl.store(RSTD + rm, r, mask=rm < T)
+
+
+@triton.jit
+def _norm_qkv_dgrad_kernel(G, W, X, RSTD, DH, DX, T, N, K: tl.constexpr,
+                           BLOCK_M: tl.constexpr, BLOCK_R: tl.constexpr):
+    """dx = dh + P - (rstd^2 / K) * x * rowsum(x * P), P = G' @ W', G' = rstd * dqkv
+    (the attention backward scales the rows as it stores dqkv): the qkv dgrad, the
+    input RMSNorm backward and the residual-gradient add in one pass. Each program
+    owns BLOCK_M whole rows, since the norm backward reduces over the full row of P."""
+    rm = tl.program_id(0) * BLOCK_M + tl.arange(0, BLOCK_M)
+    rk = tl.arange(0, K)
+    rr = tl.arange(0, BLOCK_R)
+    m = (rm < T)[:, None]
+    g_ptrs = G + rm[:, None] * N + rr[None, :]
+    w_ptrs = W + rr[:, None] * K + rk[None, :]
+    acc = tl.zeros((BLOCK_M, K), dtype=tl.float32)
+    for _ in range(0, N, BLOCK_R):
+        acc = tl.dot(tl.load(g_ptrs, mask=m, other=0.0), tl.load(w_ptrs), acc)
+        g_ptrs += BLOCK_R
+        w_ptrs += BLOCK_R * K
+    off = rm[:, None] * K + rk[None, :]
+    x = tl.load(X + off, mask=m, other=0.0).to(tl.float32)
+    r = tl.load(RSTD + rm, mask=rm < T, other=0.0)
+    coef = r * r * tl.sum(x * acc, 1) / K
+    dh = tl.load(DH + off, mask=m, other=0.0).to(tl.float32)
+    tl.store(DX + off, (dh + acc - coef[:, None] * x).to(tl.bfloat16), mask=m)
+
+
+NORM_QKV_FWD_CFG = dict(BLOCK_M=128, BLOCK_N=128, BLOCK_K=32, GROUP_M=8, num_warps=4, num_stages=3)
+NORM_QKV_DGRAD_CFG = dict(BLOCK_M=32, BLOCK_R=32, num_warps=8, num_stages=3)
+# The whole-row dgrad tile keeps BLOCK_M small, so every 32 rows re-read all of W'. At
+# hidden 512 that still beats GEMM + norm backward (1.25 vs 1.69 ms/layer); at 1024
+# (qkv 4096) it loses (8.2 vs 6.0 ms), and the backward uses the two-pass form.
+NORM_QKV_FUSED_DGRAD_MAX_D = 512
+
+
+class _NormQKVAttention(torch.autograd.Function):
+    """h = x + o_proj(attention(qk_norm_rope(qkv_proj(rmsnorm(x))))): the whole
+    attention sub-block, so the backward sees dh and folds the input RMSNorm backward
+    and the residual-gradient add into the qkv dgrad. The norm weight is folded into
+    the qkv weight (W' = W * w, one bf16 rounding of the product) and the normalized
+    input is never materialized: the backward keeps x and its rstd, and with G' =
+    rstd * dqkv the qkv weight gradient is the plain GEMM dW' = G'^T @ x. o_proj and
+    that GEMM are ordinary torch ops (inductor picks the kernels)."""
+
+    @staticmethod
+    def forward(ctx, x, norm_w, w_qkv, q_weight, k_weight, w_o, cos_table, sin_table,
+                position_ids, cu_seqlens, max_seqlen, n_heads, n_kv_heads, eps, qk_eps):
+        T_, D = x.shape
+        N = w_qkv.shape[0]
+        head_dim = cos_table.shape[1]
+        wp = (w_qkv * norm_w).to(torch.bfloat16)
+        qkv = torch.empty(T_, N, device=x.device, dtype=torch.bfloat16)
+        rstd_in = torch.empty(T_, device=x.device, dtype=torch.float32)
+        cfg = NORM_QKV_FWD_CFG
+        _norm_qkv_fwd_kernel[(triton.cdiv(T_, cfg["BLOCK_M"]) * (N // cfg["BLOCK_N"]),)](
+            x, wp.t().contiguous(), qkv, rstd_in, T_, N, EPS=eps, K=D, **cfg)
+        q, k, rstd = _qk_norm_rope_fwd(qkv, q_weight, k_weight, cos_table, sin_table,
+                                       position_ids, n_heads, n_kv_heads, qk_eps)
+        scale = head_dim ** -0.5
+        out, lse = _triton_attention_fwd(q, k, qkv, (n_heads + n_kv_heads) * head_dim,
+                                         cu_seqlens, max_seqlen, scale)
+        wo = w_o.to(torch.bfloat16)
+        h = x + out.view(T_, n_heads * head_dim) @ wo.t()
+        ctx.save_for_backward(x, norm_w, w_qkv, wp, rstd_in, qkv, q_weight, k_weight,
+                              cos_table, sin_table, position_ids, cu_seqlens, q, k, out, lse,
+                              rstd, wo)
+        ctx.shape = (n_heads, n_kv_heads, head_dim, max_seqlen, scale)
+        return h
+
+    @staticmethod
+    def backward(ctx, dh):
+        (x, norm_w, w_qkv, wp, rstd_in, qkv, q_weight, k_weight, cos_table, sin_table,
+         position_ids, cu_seqlens, q, k, out, lse, rstd, wo) = ctx.saved_tensors
+        n_heads, n_kv_heads, head_dim, max_seqlen, scale = ctx.shape
+        T_, D = x.shape
+        N = qkv.shape[1]
+        dh = dh.contiguous()
+        out2 = out.view(T_, n_heads * head_dim)
+        dout = (dh @ wo).view(T_, n_heads, head_dim)
+        dwo = dh.t() @ out2
+        dqkv = torch.empty_like(qkv)  # holds G' = rstd_in * dqkv
+        v_col = (n_heads + n_kv_heads) * head_dim
+        dq_w, dk_w = _triton_attention_bwd(
+            dout, q, k, qkv, v_col, out, lse, cu_seqlens, max_seqlen, scale, None, dqkv, v_col,
+            qk_norm=(qkv, rstd, q_weight, k_weight, cos_table, sin_table, position_ids),
+            row_scale=rstd_in)
+        if D <= NORM_QKV_FUSED_DGRAD_MAX_D:
+            dx = torch.empty_like(x)
+            cfg = NORM_QKV_DGRAD_CFG
+            _norm_qkv_dgrad_kernel[(triton.cdiv(T_, cfg["BLOCK_M"]),)](
+                dqkv, wp, x, rstd_in, dh, dx, T_, N, K=D, **cfg)
+        else:  # same math as a GEMM + one compiled norm-backward pass (see the constant)
+            p = (dqkv @ wp).float()
+            xf = x.float()
+            coef = rstd_in * rstd_in * (xf * p).sum(-1) / D
+            dx = (dh.float() + p - coef[:, None] * xf).to(x.dtype)
+        dwp = (dqkv.t() @ x).float()
+        return (dx, (dwp * w_qkv).sum(0), dwp * norm_w, dq_w, dk_w, dwo.float(),
+                None, None, None, None, None, None, None, None, None)
 
 
 # --------------------------------------------------------------------------- #
@@ -2104,7 +2276,11 @@ class Block(nn.Module):
         self.post_attention_layernorm = RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
 
     def forward(self, x, rope, cu_seqlens, max_seqlen):
-        h = x + self.self_attn(self.input_layernorm(x), rope, cu_seqlens, max_seqlen)
+        if _use_fused_norm_qkv(self.self_attn, x):
+            h = self.self_attn.forward_with_norm(x, self.input_layernorm, rope, cu_seqlens,
+                                                 max_seqlen)
+        else:
+            h = x + self.self_attn(self.input_layernorm(x), rope, cu_seqlens, max_seqlen)
         if _use_fp8_mlp(self, h):
             y = _FP8MLPBlock.apply(
                 h, self.post_attention_layernorm.weight, self.mlp.gate_up_proj.weight,
@@ -3126,6 +3302,10 @@ def parse_args() -> argparse.Namespace:
                    help="Triton varlen causal GQA attention (deterministic, native-GQA "
                         "backward, no dQ accumulator) on the fused q/k norm + RoPE path; "
                         "--no-triton-attention uses flash-attn varlen")
+    p.add_argument("--fused-norm-qkv", action=argparse.BooleanOptionalAction, default=True,
+                   help="fold each attention block's input RMSNorm into its qkv GEMM and "
+                        "the norm backward + residual-grad add into the qkv dgrad (needs "
+                        "--triton-attention; see _NormQKVAttention)")
     p.add_argument("--fused-qk-rope", action=argparse.BooleanOptionalAction, default=True,
                    help="one Triton pass each way for q/k RMSNorm + RoPE around "
                         "flash-attn (see _QKNormRoPEAttention)")
@@ -3206,8 +3386,9 @@ def main() -> None:
     elif mlp_only_layers:
         raise ValueError("--mlp-only-layers requires --num-experts > 0")
     data_seed = args.data_seed if args.data_seed is not None else args.seed
-    global FUSED_SWIGLU, FUSED_QK_ROPE, FP8_MLP, TRITON_ATTENTION
+    global FUSED_SWIGLU, FUSED_QK_ROPE, FP8_MLP, TRITON_ATTENTION, FUSED_NORM_QKV
     FUSED_SWIGLU = args.fused_swiglu
+    FUSED_NORM_QKV = args.fused_norm_qkv
     FUSED_QK_ROPE = args.fused_qk_rope
     FP8_MLP = args.fp8_mlp
     TRITON_ATTENTION = args.triton_attention
