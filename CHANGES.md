@@ -1,5 +1,94 @@
 # Changes
 
+## 2026-10-04 — superword BPE, FineWeb caches, fused LM-head cross-entropy
+
+The trainer is no longer byte-only: the tokenizer comes from the data cache.
+
+- **Superword BPE** (`tokenize_data.py train-tokenizer`): byte-level BPE with
+  no word-level pre-tokenization, so merges may span words and punctuation
+  (`as many as `, `insight into the `); the one rule is that every decimal
+  digit is its own token, so numbers are always spelled digit by digit.
+  BOS/EOS/PAD (`<|bos|>`, `<|eos|>`, `<|pad|>`) are the last three ids; text
+  that happens to contain those strings encodes as ordinary text. Trained on
+  a uniform random sample (each document kept with a seeded probability).
+  Memory grows with the sample (no word repeats to dedupe): 1 GB of text takes
+  14 min and ~65 GB RAM on a GB10, which caps the sample at ~1.5 GB.
+  `tokenizers/fineweb10bt-superword-32k/` is the 32,768-token one trained on
+  1.03 GB of FineWeb `sample-10BT` (training side only: `--val-frac 0.1
+  --split-seed 0`, the split of the caches below): 5.10 bytes/token on
+  held-out FineWeb.
+- **Caches from parquet, split by hash** (`tokenize_data.py build`): reads a
+  directory of parquet files or a jsonl file. A document is in validation iff a
+  seeded BLAKE2b hash of its id falls in the bottom `--val-frac`, decided
+  before tokenization, so the tokenizer's sample can exclude validation
+  (train it with the same `--val-frac` / `--split-seed`). Documents longer
+  than `--max-doc-tokens` (or `--max-doc-bytes`, checked before encoding) are
+  dropped, never split; each side is then written in its own seeded
+  permutation, so any prefix is a uniform sample. Per-document UTF-8 byte
+  lengths are stored. FineWeb `sample-10BT` at `--max-doc-tokens 4095`: 6.95B
+  training tokens (13.2M docs), 770M validation tokens, 1.1% of documents (15%
+  of tokens) dropped; 16 min to build.
+- **Trainer**: vocabulary size and special ids from the cache's tokenizer;
+  validation reports `val_bpb`, bits per UTF-8 byte of the validation text
+  (every document's EOS prediction included), comparable across tokenizers;
+  the HF export ships the trained `tokenizer.json`, prepending BOS on encode
+  like the training inputs.
+- **Fused LM head + cross-entropy** (`--fused-ce`, default on,
+  `_LinearCrossEntropy`). With a 32k vocabulary the loss ran outside the
+  compiled graph on a fp32 copy of the (49,152 x 32,768) logits: 355 ms of a
+  768 ms step, 33.7 GiB peak. Now, per 8,192-token chunk, a bf16 GEMM writes
+  the chunk's logits, one Triton kernel per row computes the fp32 log-sum-exp
+  and loss and writes `softmax - onehot` over them in bf16, and two GEMMs
+  produce dh and dW; the backward only scales them. 50M BPE: 64.2k -> 96.9k
+  tok/s, 33.7 -> 13.4 GiB; loss curve matches the unfused path. Byte-level is
+  unchanged (123.3k tok/s).
+
+Matched comparison, 50M default recipe and hyperparameters (tuned for bytes),
+one seed each: both caches built from `sample-10BT` with `--max-doc-bytes
+4095` (identical documents in identical order, so the byte model fits 4096
+positions), the same 6,115 validation documents (10.0 MB), a full cosine
+schedule over each run's own steps, ~50 minutes of training:
+
+| | steps | training time | text seen | final val |
+| --- | ---: | ---: | ---: | ---: |
+| byte-level (259) | 7,500 | 3,249 s | ~368 MB | 1.3036 bpb |
+| superword BPE (32k) | 5,900 | 2,890 s | ~1.46 GB | **1.2734 bpb** |
+
+BPE ends 0.030 bpb lower in 11% less time. The byte model is far more
+efficient per byte of text (it is at 1.30 after ~370 MB; BPE was near 1.48
+there) but spends ~5x the compute per byte, and its attention work per token
+is 5x BPE's on the same documents (sum of squared segment lengths per window:
+2,214 vs 443), which is also why its steps here took 432 ms rather than the
+~400 ms of the old capped-at-2,048-bytes data.
+
+## 2026-10-04 — tokenized document caches (`tokenize_data.py`)
+
+Training no longer has to hold the corpus in RAM. `tokenize_data.py` streams a
+jsonl corpus once and writes a cache: `uint16` token shards (every document as
+`[BOS] tokens [EOS]`, never split across shards), `int64` per-document offsets
+and a `manifest.json` with the tokenizer, the source checksum and the totals.
+`--train-path` / `--val-path` accept the cache directory; the trainer
+memory-maps the shards, keeps only document offsets in RAM, and reads each
+batch's documents when it is built (`DocumentTokens`). The tokenizer is still
+byte-level -- the cache encodes exactly what the jsonl path did -- and is
+defined in `tokenize_data.py`, which is where a BPE tokenizer will go.
+
+- Full 1B-token selection (786,311 docs, 20,644 batches): load + batch plan
+  19.3 s -> 0.1 s, peak process memory 4.54 -> 0.99 GB (mostly the torch
+  import), 0.25 ms to build a batch. Writing the cache: 5.4 s for 1 GB.
+- Exactness: all 20,644 batches of the 1B schedule (ids, targets, positions,
+  cu_seqlens) are identical between the cache and jsonl paths; a 5M-token run
+  from each tracks to 5 decimals through step 12 and then within run-to-run
+  noise (fresh-compile nondeterminism), 123.4k vs 122.7k tok/s.
+- The jsonl path drops its two full pair-stream copies of the corpus too:
+  batches are cut from document spans on both paths.
+- DDP: ranks all-gather (cache digest, loss tokens, docs) at startup and all
+  stop if any differ (every node reads its own copy). 2-node run from the
+  cache: 229.7k tok/s aggregate. The cache digest identifies content, not
+  layout: the same data sharded differently has the same digest, and it joins
+  the resume fingerprint for cache runs (jsonl fingerprints are unchanged, so
+  existing checkpoints still resume).
+
 ## 2026-10-01 — dense MLP RMSNorm folded into the SwiGLU GEMM; Muon update fused into Newton-Schulz
 
 1. **`--fused-norm-mlp` (default on), `_NormSwiGLU`.** The bf16 dense MLP's

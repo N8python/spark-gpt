@@ -5,6 +5,7 @@ import numpy as np
 from train import (
     LOSS_IGNORE_INDEX,
     PAD,
+    DocumentTokens,
     PackedBatch,
     build_whole_document_batches,
     materialize_packed_batch,
@@ -30,17 +31,16 @@ class WholeDocumentPackingTest(unittest.TestCase):
         self.assertEqual(covered, list(range(20)))
 
     def test_materialization_masks_only_tail_filler(self):
-        bounds = np.asarray([0, 7], dtype=np.int64)
-        inputs = np.arange(7, dtype=np.int16)
-        targets = np.arange(10, 17, dtype=np.int16)
+        docs = DocumentTokens([np.arange(8, dtype=np.uint16)], [[0, 8]])  # one 8-token doc
+        bounds = docs.pair_bounds
         batch = build_whole_document_batches(bounds, window=10)[0]
 
         ids, tgt, pos, cu = materialize_packed_batch(
-            inputs, targets, bounds, batch, window=10, max_segment_length=7
+            docs, batch, window=10, max_segment_length=7
         )
 
-        np.testing.assert_array_equal(ids[:7], inputs)
-        np.testing.assert_array_equal(tgt[:7], targets)
+        np.testing.assert_array_equal(ids[:7], np.arange(7))
+        np.testing.assert_array_equal(tgt[:7], np.arange(1, 8))
         np.testing.assert_array_equal(ids[7:], np.full(3, PAD))
         np.testing.assert_array_equal(tgt[7:], np.full(3, LOSS_IGNORE_INDEX))
         np.testing.assert_array_equal(cu, np.asarray([0, 7, 10], dtype=np.int32))
@@ -58,10 +58,9 @@ class WholeDocumentPackingTest(unittest.TestCase):
         self.assertLessEqual(int(np.diff(cu).max()), 2)
 
     def test_ddp_filler_batch_is_fully_masked(self):
-        bounds = np.asarray([0, 2], dtype=np.int64)
+        docs = DocumentTokens([np.arange(3, dtype=np.uint16)], [[0, 3]])
         ids, tgt, pos, cu = materialize_packed_batch(
-            np.arange(2), np.arange(2), bounds, PackedBatch(0, 0, 0),
-            window=6, max_segment_length=2,
+            docs, PackedBatch(0, 0, 0), window=6, max_segment_length=2,
         )
 
         np.testing.assert_array_equal(ids, np.full(6, PAD))

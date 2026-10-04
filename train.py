@@ -1,8 +1,9 @@
-"""sparkgpt: single-file DDP muP byte-level LM pretrainer for DGX Spark (GB10).
+"""sparkgpt: DDP muP byte-level LM pretrainer for DGX Spark (GB10).
 
-One file, one recipe. Qwen3-shaped decoder over raw UTF-8 bytes (vocab 259:
-256 bytes + BOS/EOS/PAD), with optional stock-exportable Qwen3-MoE feed-forward
-layers, trained with:
+One training file, one recipe (tokenize_data.py holds the tokenizer and writes
+the memory-mapped document caches this file reads). Qwen3-shaped decoder over
+raw UTF-8 bytes (vocab 259: 256 bytes + BOS/EOS/PAD), with optional
+stock-exportable Qwen3-MoE feed-forward layers, trained with:
 
   * Whole-document varlen packing -- every batch has the same static
     --tokens-per-batch shape, but document boundaries are NEVER cut. Unused
@@ -126,8 +127,10 @@ try:  # ships with every CUDA torch wheel; only used by the Muon optimizer
 except ImportError:  # pragma: no cover - CPU-only test environments
     triton = None
 
-BOS, EOS, PAD = 256, 257, 258
-VOCAB_SIZE = 259
+from tokenize_data import (  # tokenizers + tokenized document caches
+    BOS, BYTE_TOKENIZER, EOS, PAD, SPECIAL_TOKENS, TOKENIZER_FILE, VOCAB_SIZE, DocumentTokens,
+    is_document_cache, load_document_cache, manifest_digest,
+)
 LOSS_IGNORE_INDEX = -100
 PACKING_FORMAT = "whole_document_static_v1"
 
@@ -2371,6 +2374,98 @@ class Block(nn.Module):
         return h + self.mlp(mlp_input), None, None
 
 
+# --------------------------------------------------------------------------- #
+# Fused LM head + cross-entropy (Triton), chunked over tokens
+# --------------------------------------------------------------------------- #
+FUSED_CE = True  # --no-fused-ce: logits = lm_head(h), then F.cross_entropy on fp32 logits
+FUSED_CE_CHUNK = 8192  # tokens per chunk: one (chunk, vocab) bf16 logits buffer at a time
+
+
+@triton.jit
+def _ce_rows_kernel(LOGITS, TARGETS, LOSS, V, stride, IGNORE: tl.constexpr,
+                    WRITE_GRAD: tl.constexpr, BLOCK_V: tl.constexpr):
+    """One row of a (rows, V) bf16 logits chunk: loss = logsumexp - logit[target]
+    in fp32 (an online max/sum pass), and with WRITE_GRAD the gradient
+    softmax - onehot written over the logits in bf16. Ignored rows get loss 0
+    and a zero gradient."""
+    row = tl.program_id(0)
+    base = LOGITS + row.to(tl.int64) * stride
+    cols = tl.arange(0, BLOCK_V)
+    # finite sentinel, not -inf: a lane that never sees a column (V < BLOCK_V)
+    # would otherwise compute exp(-inf - -inf) = NaN; masked lanes add exactly 0
+    m = tl.full((BLOCK_V,), -1.0e30, tl.float32)
+    s = tl.zeros((BLOCK_V,), tl.float32)
+    for v0 in range(0, V, BLOCK_V):
+        vmask = v0 + cols < V
+        x = tl.load(base + v0 + cols, mask=vmask, other=-1.0e30).to(tl.float32)
+        m_new = tl.maximum(m, x)
+        s = s * tl.exp(m - m_new) + tl.where(vmask, tl.exp(x - m_new), 0.0)
+        m = m_new
+    m_row = tl.max(m, 0)
+    lse = m_row + tl.log(tl.sum(s * tl.exp(m - m_row), 0))
+    t = tl.load(TARGETS + row)
+    valid = t != IGNORE
+    t_safe = tl.where(valid, t, 0)
+    x_t = tl.load(base + t_safe).to(tl.float32)
+    tl.store(LOSS + row, tl.where(valid, lse - x_t, 0.0))
+    if WRITE_GRAD:
+        for v0 in range(0, V, BLOCK_V):
+            idx = v0 + cols
+            vmask = idx < V
+            x = tl.load(base + idx, mask=vmask, other=0.0).to(tl.float32)
+            g = tl.exp(x - lse) - tl.where(idx == t_safe, 1.0, 0.0)
+            g = tl.where(valid, g, 0.0)
+            tl.store(base + idx, g.to(tl.bfloat16), mask=vmask)
+
+
+class _LinearCrossEntropy(torch.autograd.Function):
+    """sum over rows of cross_entropy(h @ W^T, targets) without materializing the
+    (tokens, vocab) logits: per chunk, a bf16 GEMM writes the chunk's logits,
+    _ce_rows_kernel turns them into per-row losses and (training) the gradient
+    softmax - onehot in place, and two GEMMs consume it for dh and dW. The
+    gradients are computed in the forward and scaled by the incoming scalar
+    gradient in the backward. Same rounding as the unfused path: bf16 logits,
+    fp32 log-sum-exp, a bf16 logits gradient."""
+
+    @staticmethod
+    def forward(ctx, h, weight, targets, with_grad):
+        T, D = h.shape
+        V = weight.shape[0]
+        wb = weight.to(torch.bfloat16)
+        losses, dhs = [], []
+        dw = torch.zeros(V, D, device=h.device, dtype=torch.float32) if with_grad else None
+        for s in range(0, T, FUSED_CE_CHUNK):
+            hc = h[s:s + FUSED_CE_CHUNK]
+            tc = targets[s:s + FUSED_CE_CHUNK].contiguous()
+            logits = hc @ wb.t()
+            loss = torch.empty(hc.shape[0], device=h.device, dtype=torch.float32)
+            _ce_rows_kernel[(hc.shape[0],)](
+                logits, tc, loss, V, logits.stride(0), IGNORE=LOSS_IGNORE_INDEX,
+                WRITE_GRAD=with_grad, BLOCK_V=4096, num_warps=8)
+            losses.append(loss)
+            if with_grad:  # logits now holds d(loss)/d(logits)
+                dhs.append(logits @ wb)
+                dw += (logits.t() @ hc).float()
+        if with_grad:
+            ctx.save_for_backward(torch.cat(dhs), dw)
+        return torch.cat(losses).sum()
+
+    @staticmethod
+    def backward(ctx, grad):
+        dh, dw = ctx.saved_tensors
+        return dh * grad.to(dh.dtype), dw * grad, None, None
+
+
+def lm_head_loss(h: torch.Tensor, weight: torch.Tensor, targets: torch.Tensor) -> torch.Tensor:
+    """Summed cross-entropy of lm_head(h) against targets (ignore_index rows skipped)."""
+    if FUSED_CE and triton is not None and h.is_cuda and h.dtype == torch.bfloat16:
+        with_grad = torch.is_grad_enabled() and (h.requires_grad or weight.requires_grad)
+        return _LinearCrossEntropy.apply(h, weight, targets, with_grad)
+    logits = F.linear(h, weight.to(h.dtype))
+    return F.cross_entropy(logits.float(), targets, ignore_index=LOSS_IGNORE_INDEX,
+                           reduction="sum")
+
+
 class ByteLM(nn.Module):
     """Qwen3-shaped byte LM, flat packed (total_tokens,) layout, fused
     qkv/gate_up, untied lm_head (muP)."""
@@ -2403,7 +2498,10 @@ class ByteLM(nn.Module):
         cu_seqlens,
         max_seqlen,
         output_router_logits: bool = False,
+        targets=None,
     ):
+        """Logits, or with targets the summed cross-entropy (fused LM head + loss,
+        no logits materialized), plus router outputs if requested."""
         x = self.embed_tokens(input_ids)
         autocast_enabled = torch.is_autocast_enabled(x.device.type)
         rope_dtype = (
@@ -2431,10 +2529,14 @@ class ByteLM(nn.Module):
             if layer_router_logits is not None:
                 router_logits.append(layer_router_logits)
                 selected_experts.append(layer_selected_experts)
-        logits = self.lm_head(self.norm(x))
+        h = self.norm(x)
+        if targets is not None:
+            out = lm_head_loss(h, self.lm_head.weight, targets)
+        else:
+            out = self.lm_head(h)
         if output_router_logits:
-            return logits, tuple(router_logits), tuple(selected_experts)
-        return logits
+            return out, tuple(router_logits), tuple(selected_experts)
+        return out
 
 
 def export_unfused_state_dict(model: ByteLM) -> dict:
@@ -2509,8 +2611,12 @@ def _byte_tokenizer_json() -> dict:
     }
 
 
-def export_hf(model: ByteLM, out_dir: Path) -> None:
-    """Write a ready-to-load stock Qwen3 or Qwen3-MoE HF directory."""
+def export_hf(model: ByteLM, out_dir: Path, tokenizer: dict | None = None) -> None:
+    """Write a ready-to-load stock Qwen3 or Qwen3-MoE HF directory. tokenizer is
+    load_documents' {"spec", "file"}; None means the byte tokenizer."""
+    tokenizer = tokenizer or {"spec": BYTE_TOKENIZER, "file": None}
+    spec = tokenizer["spec"]
+    bos, eos, pad = spec["bos"], spec["eos"], spec["pad"]
     from safetensors.torch import save_file
 
     cfg = model.config
@@ -2541,9 +2647,9 @@ def export_hf(model: ByteLM, out_dir: Path) -> None:
         "attention_dropout": 0.0,
         "tie_word_embeddings": False,
         "use_cache": True,
-        "bos_token_id": BOS,
-        "eos_token_id": EOS,
-        "pad_token_id": PAD,
+        "bos_token_id": bos,
+        "eos_token_id": eos,
+        "pad_token_id": pad,
         "torch_dtype": "float32",
     }
     if is_moe:
@@ -2563,13 +2669,23 @@ def export_hf(model: ByteLM, out_dir: Path) -> None:
         json.dumps(hf_config, indent=2), encoding="utf-8"
     )
     (out_dir / "generation_config.json").write_text(json.dumps({
-        "bos_token_id": BOS, "eos_token_id": EOS, "pad_token_id": PAD,
+        "bos_token_id": bos, "eos_token_id": eos, "pad_token_id": pad,
     }, indent=2), encoding="utf-8")
-    (out_dir / "tokenizer.json").write_text(
-        json.dumps(_byte_tokenizer_json(), ensure_ascii=False), encoding="utf-8")
+    if tokenizer["file"] is None:
+        (out_dir / "tokenizer.json").write_text(
+            json.dumps(_byte_tokenizer_json(), ensure_ascii=False), encoding="utf-8")
+        names = ("<bos>", "<eos>", "<pad>")
+    else:  # the trained BPE, prepending BOS on encode like the training inputs
+        from tokenizers import Tokenizer, processors
+        hf_tok = Tokenizer.from_file(str(tokenizer["file"]))
+        names = SPECIAL_TOKENS
+        hf_tok.post_processor = processors.TemplateProcessing(
+            single=f"{names[0]} $A", pair=f"{names[0]} $A {names[0]} $B:1",
+            special_tokens=[(names[0], bos)])
+        hf_tok.save(str(out_dir / "tokenizer.json"))
     (out_dir / "tokenizer_config.json").write_text(json.dumps({
         "tokenizer_class": "PreTrainedTokenizerFast",
-        "bos_token": "<bos>", "eos_token": "<eos>", "pad_token": "<pad>",
+        "bos_token": names[0], "eos_token": names[1], "pad_token": names[2],
         "model_max_length": cfg.max_position_embeddings,
         "clean_up_tokenization_spaces": False,
     }, indent=2), encoding="utf-8")
@@ -3116,19 +3232,22 @@ def load_compact_tokenized(path: Path, *, target_tokens: int | None,
     return flat, offsets, loss_tokens, len(offsets) - 1
 
 
-def build_pair_streams(flat: np.ndarray, offsets: list[int]):
-    """Per-doc (input, target) pair streams: doc tokens [t0..tn] contribute
-    inputs t0..t(n-1) and targets t1..tn -- every packed position has a real
-    target and no target crosses a doc boundary. `bounds` are cumulative
-    pair-stream offsets of doc boundaries."""
-    starts = np.asarray(offsets[:-1], dtype=np.int64)
-    ends = np.asarray(offsets[1:], dtype=np.int64)
-    keep_in = np.ones(flat.shape[0], dtype=bool)
-    keep_in[ends - 1] = False
-    keep_tg = np.ones(flat.shape[0], dtype=bool)
-    keep_tg[starts] = False
-    bounds = np.concatenate([[0], np.cumsum(ends - starts - 1)])
-    return flat[keep_in], flat[keep_tg], bounds
+def load_documents(path: Path, *, target_tokens: int | None):
+    """(selected documents, cache digest, tokenizer). Documents are taken in file
+    order by loss-token budget. A tokenize_data.py cache directory is memory-
+    mapped; a jsonl file is byte-encoded into RAM (digest None). tokenizer is
+    {"spec": vocab/special ids, "file": tokenizer.json path or None (bytes)}."""
+    if is_document_cache(path):
+        docs, manifest = load_document_cache(path)
+        spec = manifest["tokenizer"]
+        tok_file = None if spec["type"] == BYTE_TOKENIZER["type"] else Path(path) / TOKENIZER_FILE
+        if spec["type"] == BYTE_TOKENIZER["type"] and spec != BYTE_TOKENIZER:
+            raise ValueError(f"{path}: byte tokenizer {spec} differs from {BYTE_TOKENIZER}")
+        return docs.select(target_tokens), manifest_digest(manifest), {"spec": spec, "file": tok_file}
+    flat, offsets, _, _ = load_compact_tokenized(path, target_tokens=target_tokens)
+    offsets = np.asarray(offsets, dtype=np.int64)
+    docs = DocumentTokens([flat], [offsets], [np.diff(offsets) - 2])  # bytes = tokens - BOS/EOS
+    return docs, None, {"spec": BYTE_TOKENIZER, "file": None}
 
 
 @dataclass(frozen=True)
@@ -3207,18 +3326,20 @@ def packed_batch_metadata(bounds: np.ndarray, batch: PackedBatch, window: int,
     return cu, pos
 
 
-def materialize_packed_batch(inputs: np.ndarray, targets: np.ndarray,
-                             bounds: np.ndarray, batch: PackedBatch, window: int,
-                             max_segment_length: int):
-    """Return static-shape arrays; only the prefix contains loss-bearing data."""
+def materialize_packed_batch(docs: DocumentTokens, batch: PackedBatch, window: int,
+                             max_segment_length: int, pad: int = PAD):
+    """Return static-shape arrays; only the prefix contains loss-bearing data.
+    The batch's documents are read from docs (RAM or memory-mapped shards)."""
+    bounds = docs.pair_bounds
     lo = int(bounds[batch.start_doc])
     hi = int(bounds[batch.end_doc])
     if hi - lo != batch.real_tokens:
         raise ValueError("packed batch token count does not match source span")
-    ids = np.full(window, PAD, dtype=np.int64)
+    inputs, targets = docs.pairs(batch.start_doc, batch.end_doc)
+    ids = np.full(window, pad, dtype=np.int64)
     tgt = np.full(window, LOSS_IGNORE_INDEX, dtype=np.int64)
-    ids[:batch.real_tokens] = inputs[lo:hi]
-    tgt[:batch.real_tokens] = targets[lo:hi]
+    ids[:batch.real_tokens] = inputs
+    tgt[:batch.real_tokens] = targets
     cu, pos = packed_batch_metadata(
         bounds, batch, window, max_segment_length
     )
@@ -3425,6 +3546,9 @@ def parse_args() -> argparse.Namespace:
                    help="fold each attention block's input RMSNorm into its qkv GEMM and "
                         "the norm backward + residual-grad add into the qkv dgrad (needs "
                         "--triton-attention; see _NormQKVAttention)")
+    p.add_argument("--fused-ce", action=argparse.BooleanOptionalAction, default=True,
+                   help="fused LM head + cross-entropy, chunked over tokens: the (tokens, "
+                        "vocab) logits are never materialized (see _LinearCrossEntropy)")
     p.add_argument("--fused-norm-mlp", action=argparse.BooleanOptionalAction, default=True,
                    help="fold each dense MLP's RMSNorm into its fused SwiGLU GEMM "
                         "(needs --fused-swiglu; see _NormSwiGLU)")
@@ -3509,7 +3633,9 @@ def main() -> None:
         raise ValueError("--mlp-only-layers requires --num-experts > 0")
     data_seed = args.data_seed if args.data_seed is not None else args.seed
     global FUSED_SWIGLU, FUSED_QK_ROPE, FP8_MLP, TRITON_ATTENTION, FUSED_NORM_QKV, FUSED_NORM_MLP
+    global FUSED_CE
     FUSED_SWIGLU = args.fused_swiglu
+    FUSED_CE = args.fused_ce
     FUSED_NORM_MLP = args.fused_norm_mlp
     FUSED_NORM_QKV = args.fused_norm_qkv
     FUSED_QK_ROPE = args.fused_qk_rope
@@ -3538,10 +3664,20 @@ def main() -> None:
 
     # ---- data ----
     data_start = time.perf_counter()
-    flat, offsets, selected_tokens, num_docs = load_compact_tokenized(
+    train_docs, train_cache, tokenizer = load_documents(
         Path(args.train_path), target_tokens=args.target_tokens
     )
-    inputs_np, targets_np, bounds = build_pair_streams(flat, offsets)
+    tok_spec = tokenizer["spec"]
+    selected_tokens, num_docs = train_docs.num_pairs, train_docs.num_docs
+    bounds = train_docs.pair_bounds
+    if distributed:
+        # every rank reads its own local copy of the data: all must hold the same
+        # documents, and all must stop if not (not just the odd one out)
+        identities = [None] * world_size
+        dist.all_gather_object(identities, (train_cache, selected_tokens, num_docs))
+        if len(set(identities)) != 1:
+            raise ValueError(f"rank {rank}: ranks loaded different training data "
+                             f"(cache digest, loss tokens, docs per rank): {identities}")
     window = args.tokens_per_batch
     max_doc_pairs = int(np.diff(bounds).max())
     train_batches = build_whole_document_batches(bounds, window)
@@ -3588,11 +3724,14 @@ def main() -> None:
     # Held-out validation set (rank 0 only): whole-document packed in file order
     # so the metric is stable across runs.
     val_windows: list = []
+    val_bytes = 0
     if args.val_path and is_main:
-        vflat, voffsets, _, _ = load_compact_tokenized(
-            Path(args.val_path), target_tokens=args.val_tokens
-        )
-        vin, vtg, vbounds = build_pair_streams(vflat, voffsets)
+        vdocs, _, vtokenizer = load_documents(Path(args.val_path), target_tokens=args.val_tokens)
+        if vtokenizer["spec"] != tok_spec:
+            raise ValueError(f"--val-path tokenizer {vtokenizer['spec']} differs from "
+                             f"--train-path's {tok_spec}")
+        val_bytes = vdocs.num_bytes
+        vbounds = vdocs.pair_bounds
         val_batches = build_whole_document_batches(vbounds, window)
         val_max_seg = int(np.diff(vbounds).max())
         if val_max_seg > args.max_position_embeddings:
@@ -3600,7 +3739,7 @@ def main() -> None:
         global_max_seqlen = max(global_max_seqlen, val_max_seg)
         for val_batch in val_batches:
             ids, tgt, pos, cu = materialize_packed_batch(
-                vin, vtg, vbounds, val_batch, window, global_max_seqlen
+                vdocs, val_batch, window, global_max_seqlen, pad=tok_spec["pad"]
             )
             val_windows.append((ids, tgt, pos, cu, val_batch.real_tokens))
     if distributed:
@@ -3613,6 +3752,7 @@ def main() -> None:
 
     # ---- model / muP / DDP / compile ----
     config = ModelConfig(
+        vocab_size=tok_spec["vocab_size"],
         hidden_size=args.model_dim,
         num_hidden_layers=args.model_layers,
         intermediate_size=args.intermediate_size,
@@ -3676,6 +3816,7 @@ def main() -> None:
         "cuda_device": torch.cuda.get_device_name(0),
         "selected_docs": num_docs,
         "selected_loss_tokens": selected_tokens,
+        "train_cache": train_cache,
         "packing_format": PACKING_FORMAT,
         "window_tokens": window,
         "packed_real_batches": len(train_batches),
@@ -3714,7 +3855,7 @@ def main() -> None:
     def batch_for(w: int):
         packed = train_batches[w] if w >= 0 else PackedBatch(0, 0, 0)
         ids_np, tgt_np, pos, cu = materialize_packed_batch(
-            inputs_np, targets_np, bounds, packed, window, global_max_seqlen
+            train_docs, packed, window, global_max_seqlen, pad=tok_spec["pad"]
         )
         ids = torch.from_numpy(ids_np).to(device, non_blocking=True)
         tgt = torch.from_numpy(tgt_np).to(device, non_blocking=True)
@@ -3732,14 +3873,12 @@ def main() -> None:
                 cu_t,
                 global_max_seqlen,
                 output_router_logits=config.num_experts > 0,
+                targets=tgt,
             )
             if config.num_experts > 0:
-                logits, router_logits, selected_experts = model_output
+                loss_sum, router_logits, selected_experts = model_output
             else:
-                logits = model_output
-            loss_sum = F.cross_entropy(
-                logits.float(), tgt, ignore_index=LOSS_IGNORE_INDEX, reduction="sum"
-            )
+                loss_sum = model_output
         # Packed batches contain different numbers of real targets. DDP averages
         # gradients across ranks, so compensate by world_size/global_tokens to
         # make the result exactly the global token-mean gradient.
@@ -3774,19 +3913,18 @@ def main() -> None:
                           "val_interval_steps": val_interval}), flush=True)
 
     @torch.no_grad()
-    def run_val() -> float:
+    def run_val() -> tuple[float, float]:
+        """(mean loss per target token, bits per UTF-8 byte of the val text): bpb
+        compares runs across tokenizers (every doc's EOS prediction included)."""
         raw_model.eval()
         total_loss, total_toks = 0.0, 0
         for ids, tgt, pos_t, cu_t, real_tokens in val_gpu:
             with torch.amp.autocast(device_type="cuda", dtype=torch.bfloat16):
-                logits = raw_model(ids, pos_t, cu_t, global_max_seqlen)
-                loss = F.cross_entropy(
-                    logits.float(), tgt, ignore_index=LOSS_IGNORE_INDEX, reduction="sum"
-                )
+                loss = raw_model(ids, pos_t, cu_t, global_max_seqlen, targets=tgt)
             total_loss += loss.float().item()
             total_toks += real_tokens
         raw_model.train()
-        return total_loss / max(1, total_toks)
+        return total_loss / max(1, total_toks), total_loss / math.log(2) / max(1, val_bytes)
 
     # ---- resume ----
     # The packed-batch schedule is deterministic (data_seed + fingerprint below), so a
@@ -3810,6 +3948,8 @@ def main() -> None:
         "warmup_steps": warmup_steps,
         "val_interval_steps": val_interval,
     }
+    if train_cache is not None:  # jsonl fingerprints stay as they were (old checkpoints resume)
+        fingerprint["train_cache"] = train_cache
 
     def save_resumable(step: int):
         torch.save({
@@ -3820,7 +3960,7 @@ def main() -> None:
             "fingerprint": fingerprint,
         }, run_dir / f"ckpt_step{step:07d}.pt")
         if is_main:  # ready-to-load HF twin (model only)
-            export_hf(raw_model, run_dir / f"hf_step{step:07d}")
+            export_hf(raw_model, run_dir / f"hf_step{step:07d}", tokenizer)
 
     start_step = 0
     if args.resume:
@@ -3974,14 +4114,14 @@ def main() -> None:
 
         if val_gpu and (step % val_interval == 0 or step == steps_total):
             validation_started_at = time.perf_counter()
-            v_loss = run_val()
+            v_loss, v_bpb = run_val()
             validation_finished_at = time.perf_counter()
             validation_seconds = validation_finished_at - validation_started_at
             cumulative_validation_seconds += validation_seconds
-            last_val_loss = v_loss
+            last_val_loss, last_val_bpb = v_loss, v_bpb
             elapsed_at_validation = validation_finished_at - started_at
             vrec = {"event": "validation", "step": step, "total_steps": steps_total,
-                    "val_loss": v_loss,
+                    "val_loss": v_loss, "val_bpb": v_bpb,
                     "elapsed_seconds": elapsed_at_validation,
                     "training_elapsed_seconds":
                         elapsed_at_validation - cumulative_validation_seconds,
@@ -3991,7 +4131,7 @@ def main() -> None:
             metrics_file.write(json.dumps(vrec) + "\n")
             metrics_file.flush()
             if wandb_run is not None:
-                wandb_run.log({"val/loss": v_loss, "train/step": step,
+                wandb_run.log({"val/loss": v_loss, "val/bpb": v_bpb, "train/step": step,
                                "train/tokens": global_total_tokens})
 
         if args.save_every and step % args.save_every == 0:
@@ -4019,6 +4159,7 @@ def main() -> None:
     }
     if last_val_loss is not None:
         finished["final_val_loss"] = last_val_loss
+        finished["final_val_bpb"] = last_val_bpb
     if last_router_stats is not None:
         finished.update({
             "final_router_aux_loss": float(last_router_stats["aux_loss"].item()),
@@ -4047,7 +4188,7 @@ def main() -> None:
         metrics_file.close()
         if args.save_final:
             torch.save(raw_model.state_dict(), run_dir / "model_final.pt")
-            export_hf(raw_model, run_dir / "hf")
+            export_hf(raw_model, run_dir / "hf", tokenizer)
         (run_dir / "summary.json").write_text(json.dumps(finished, indent=2), encoding="utf-8")
         print(json.dumps(finished), flush=True)
         if wandb_run is not None:

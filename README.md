@@ -2,13 +2,22 @@
 
 (Written by Claude Fable 5, with assistance from N8Programs)
 
-A **single-file** byte-level LM pretrainer, tuned for the NVIDIA DGX Spark
-(GB10) but happy on any modern CUDA GPU. Everything lives in
-[train.py](train.py): the model, the optimizer, the data pipeline, distributed
-training, and checkpoint export. No framework, no config system, no second file.
+An LM pretrainer -- byte-level by default, or on a trained superword BPE --
+tuned for the NVIDIA DGX Spark (GB10) but happy on any modern CUDA GPU. The training side lives in [train.py](train.py): the
+model, the optimizer, the packing and batch pipeline, distributed training, and
+checkpoint export. [tokenize_data.py](tokenize_data.py) owns the tokenizer and
+writes the memory-mapped document caches training reads. No framework, no
+config system.
 
-- **Byte-level**: raw UTF-8 bytes, vocab 259 (256 bytes + BOS/EOS/PAD). No
-  tokenizer training, no OOV, fully multilingual by construction.
+- **Byte-level by default**: raw UTF-8 bytes, vocab 259 (256 bytes +
+  BOS/EOS/PAD). No tokenizer training, no OOV, fully multilingual by
+  construction.
+- **Or a superword BPE**: `tokenize_data.py` trains a byte-level BPE whose
+  merges may span words, with one rule -- every digit is its own token -- and
+  [tokenizers/fineweb10bt-superword-32k](tokenizers/fineweb10bt-superword-32k)
+  ships a 32k one trained on FineWeb. The tokenizer comes from the data cache:
+  `train.py` sizes the vocabulary and special ids from it and exports it with
+  the HF checkpoint.
 - **Qwen3-shaped model**: GQA, qk-norm, SwiGLU, rotate-half RoPE — numerically
   identical to HF `Qwen3ForCausalLM`, so checkpoints export as stock HF models.
 - **Optional Qwen3-MoE layers**: bias-free fp32-softmax top-k routing, packed
@@ -69,12 +78,73 @@ Each document must fit within both `--tokens-per-batch` and
 `--max-position-embeddings` after byte tokenization. The trainer raises a clear
 error for an oversized document instead of silently splitting its context.
 
+**Tokenize once, then train from the cache** (recommended):
+
+```bash
+python tokenize_data.py build lang_data/fineweb_1b.jsonl lang_data/fineweb_1b.bytes
+python tokenize_data.py build lang_data/fineweb_10m_val_fixed_seed0.jsonl \
+    lang_data/fineweb_10m_val_fixed_seed0.bytes
+python train.py --train-path lang_data/fineweb_1b.bytes \
+    --val-path lang_data/fineweb_10m_val_fixed_seed0.bytes ...
+```
+
+The cache is `uint16` token shards (documents never split across shards, ~1B
+tokens each by default) plus per-document offsets and a `manifest.json` that
+records the tokenizer and the source file's checksum. Training memory-maps the
+shards and reads only the documents of each batch, so RAM no longer scales
+with the corpus: a 1B-token run loads in 0.1 s and ~1 GB of process memory
+(vs ~19 s and 4.5 GB encoding the jsonl). It produces exactly the batches of
+the jsonl path. `--train-path` / `--val-path` still accept a jsonl file
+directly; that path encodes into RAM at startup. In multi-node runs every node
+reads its own copy of the cache, and training refuses to start if the ranks'
+caches differ. Tokenizing takes ~5 s per GB of text on a GB10.
+
+**Ready-made BPE caches.** The train and validation caches that the
+from-scratch commands below build (FineWeb `sample-10BT`, the shipped
+tokenizer, `--max-doc-tokens 4095`, 10% validation split; 6.95B training and
+770M validation tokens, 15.5 GB) are on the Hub, ready to train on:
+
+```bash
+hf download N8Programs/lang_data --repo-type dataset --local-dir lang_data \
+    --include "fineweb10bt.tok32k/*" --include "fineweb10bt.tok32k.val/*"
+python train.py --train-path lang_data/fineweb10bt.tok32k \
+    --val-path lang_data/fineweb10bt.tok32k.val ...
+```
+
+**BPE on FineWeb, from scratch.** The `sample-10BT` subset of
+[FineWeb](https://huggingface.co/datasets/HuggingFaceFW/fineweb) (15 parquet
+files, 30.6 GB) is a uniform random sample of the full dataset:
+
+```bash
+hf download HuggingFaceFW/fineweb --repo-type dataset --include "sample/10BT/*" --local-dir fineweb
+# optional: train your own tokenizer (14 min, ~65 GB RAM for a 1 GB sample)
+python tokenize_data.py train-tokenizer fineweb/sample/10BT my_tok --vocab-size 32768 \
+    --sample-frac 0.025 --val-frac 0.1
+python tokenize_data.py build fineweb/sample/10BT fw.tok32k \
+    --tokenizer tokenizers/fineweb10bt-superword-32k \
+    --max-doc-tokens 4095 --shuffle-seed 0 --val-frac 0.1 --val-out fw.tok32k.val
+python train.py --train-path fw.tok32k --val-path fw.tok32k.val ...
+```
+
+The validation split is a seeded hash of each document's id (10%), decided
+before tokenization, so the tokenizer never trains on validation text.
+Documents longer than `--max-doc-tokens` are dropped, never split (4095 leaves
+room for BOS in 4096 positions: 1.1% of FineWeb's documents, 15% of its
+tokens), and each side is written in its own seeded permutation, so any prefix
+(`--target-tokens`, `--val-tokens`) is a uniform sample. The shipped tokenizer
+gives 5.1 bytes/token on held-out FineWeb; the cache above holds 6.95B
+training tokens and builds in ~16 min. Validation reports `val_bpb` (bits per
+UTF-8 byte), which is comparable across tokenizers. On identical documents
+(<= 4,095 bytes, both caches built with `--max-doc-bytes 4095`) and a matched
+~50-minute budget, the 50M model reached 1.273 bpb with this tokenizer vs
+1.304 byte-level, in 11% less time (see [CHANGES.md](CHANGES.md)).
+
 Ready-made example data (the FineWeb slices the defaults point at, including
 `fineweb_1b.jsonl`) is available at
 [N8Programs/lang_data](https://huggingface.co/datasets/N8Programs/lang_data):
 
 ```bash
-hf download N8Programs/lang_data --repo-type dataset --local-dir lang_data
+hf download N8Programs/lang_data --repo-type dataset --local-dir lang_data --include "*.jsonl"
 ```
 
 Or build your own slice — e.g. 1B tokens of FineWeb:
@@ -146,10 +216,13 @@ transfers to any width in the family.
 - `--save-every N` writes resumable checkpoints (model + optimizer + scheduler
   + step) every N steps, each rank to its own disk; rerun the same command with
   `--resume` after a crash and training rejoins the exact data stream (a
-  fingerprint guards against mismatched data/sharding).
+  fingerprint guards against mismatched data/sharding; with a cache it
+  includes the cache's content digest).
 - `--val-path lang_data/fineweb_10m_val_fixed_seed0.jsonl` (the val slice ships
   with the example data) evaluates a fixed held-out set every 5% of training
-  and at the end — `val/loss` in wandb, `final_val_loss` in `summary.json`.
+  and at the end — `val/loss` and `val/bpb` (bits per UTF-8 byte, comparable
+  across tokenizers) in wandb, `final_val_loss` / `final_val_bpb` in
+  `summary.json`.
 - `--save-final` writes `model_final.pt` (native fused layout) and
   `checkpoints/<run>/hf/` — the ready-to-load HF directory (periodic saves get
   `hf_step<N>/` twins on rank 0). Dense exports load as `Qwen3ForCausalLM` and
@@ -181,7 +254,9 @@ accumulator, and applies the RoPE + q/k-norm backward in its epilogues;
 `--no-triton-attention` falls back to flash-attn. Each attention block's
 input RMSNorm is folded into its qkv GEMM in both directions
 (`--fused-norm-qkv`, on by default), and each dense MLP's into its SwiGLU
-GEMM (`--fused-norm-mlp`, on by default). GEMM autotuning
+GEMM (`--fused-norm-mlp`, on by default), and the LM head and cross-entropy
+run as one chunked pass that never materializes the logits (`--fused-ce`, on
+by default). GEMM autotuning
 benchmarks on every rank; identical GB10s pick identical kernels (2-node
 checkpoints verified bit-identical), but on heterogeneous nodes use
 `--no-autotune-gemm`. At the 0.6B shape the
